@@ -1,0 +1,32 @@
+version: "3"
+
+services:
+  franka_direct_nuc:
+    image: droid-nuc-test
+    environment:
+      ROBOT_IP:          ${ROBOT_IP}
+      NUC_IP:            ${NUC_IP}
+      LAPTOP_IP:         ${LAPTOP_IP}
+      LIBFRANKA_VERSION: ${LIBFRANKA_VERSION}
+    volumes:
+      - ${ROOT_DIR}/src:/app/src
+      - ${ROOT_DIR}/proto:/app/proto
+      - ${ROOT_DIR}/python:/app/python
+      - ${ROOT_DIR}/config:/app/config
+      - ${ROOT_DIR}/build.sh:/app/build.sh
+      - ${ROOT_DIR}/CMakeLists.txt:/app/CMakeLists.txt
+      - ${ROOT_DIR}/launch_server.sh:/app/launch_server.sh
+      - ${ROOT_DIR}/launch_server_cartesian.sh:/app/launch_server_cartesian.sh
+    devices:
+      - "/dev:/dev"
+    privileged: true
+    network_mode: "host"
+    cap_add:
+      - SYS_NICE
+    ulimits:
+      rtprio: 99
+      memlock: 102400
+    deploy:
+      restart_policy:
+        condition: any
+    command: sleep infinity

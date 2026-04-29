@@ -1,0 +1,5 @@
+recordings/*.mp4
+__pycache__/
+build/
+python/franka_control_pb2*.py
+recordings/

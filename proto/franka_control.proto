@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package franka_control;
+
+service FrankaControl {
+    // Set desired joint positions (7 doubles in radians)
+    rpc SetJointTarget   (JointTarget)   returns (CommandResult);
+    // Set desired end-effector pose (4x4 col-major, 16 doubles)
+    rpc SetEETarget      (EETarget)      returns (CommandResult);
+    // Set desired gripper opening width
+    rpc SetGripperTarget (GripperTarget) returns (CommandResult);
+    // Read current robot + gripper state
+    rpc GetRobotState    (Empty)         returns (RobotState);
+    // Move robot to a joint configuration (blocks until complete)
+    rpc ResetToJoints    (JointResetTarget) returns (CommandResult);
+    // Stop the control loop gracefully
+    rpc Stop             (Empty)         returns (CommandResult);
+}
+
+message Empty {}
+
+message JointTarget {
+    // 7 joint positions in radians
+    repeated double q = 1;
+}
+
+message EETarget {
+    // 4x4 homogeneous transform, column-major (16 doubles)
+    // Same layout as libfranka O_T_EE
+    repeated double pose = 1;
+}
+
+message GripperTarget {
+    // Desired opening width [m], range [0, 0.08]
+    double width = 1;
+    // Max speed [m/s], range [0.01, 0.2]; 0 → use default (0.1 m/s)
+    double speed = 2;
+}
+
+message JointResetTarget {
+    // 7 joint angles in radians
+    repeated double q = 1;
+    // Speed factor [0..1]; 0 → use default (0.3)
+    double speed = 2;
+    // Max duration in seconds; 0 → use default (5.0)
+    double max_duration = 3;
+}
+
+message RobotState {
+    repeated double pose          = 1;   // O_T_EE col-major (16 doubles) — actual measured pose
+    repeated double q             = 2;   // joint positions (7 doubles) — actual measured
+    double cmd_success_rate       = 3;   // libfranka control_command_success_rate
+    bool   ready                  = 4;   // true once arm control loop is running
+    string error                  = 5;   // non-empty if fatal error
+    repeated double target_q      = 6;   // current interpolated joint command (7 doubles)
+    double gripper_width          = 7;   // actual gripper opening [m]
+    bool   gripper_grasping       = 8;   // true while gripping an object
+    repeated double target_pose   = 9;   // current commanded EE pose (16 doubles)
+    repeated double dq            = 10;  // joint velocities (7 doubles) — actual measured
+}
+
+message CommandResult {
+    bool   success = 1;
+    string message = 2;
+}

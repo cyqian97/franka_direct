@@ -1,0 +1,32 @@
+version: "3"
+
+services:
+  franka_direct_laptop:
+    image: ghcr.io/droid-dataset/droid_laptop:fr3
+    environment:
+      ROOT_DIR:                    ${ROOT_DIR}
+      DISPLAY:                     ${DISPLAY}
+      XAUTHORITY:                  ${DOCKER_XAUTH}
+      NUC_IP:                      ${NUC_IP}
+      ROBOT_IP:                    ${ROBOT_IP}
+      LAPTOP_IP:                   ${LAPTOP_IP}
+      LIBFRANKA_VERSION:           ${LIBFRANKA_VERSION}
+      NVIDIA_VISIBLE_DEVICES:      all
+      ANDROID_ADB_SERVER_ADDRESS:  host.docker.internal
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${DOCKER_XAUTH}:${DOCKER_XAUTH}
+      - ${ROOT_DIR}/scripts:/app/scripts
+      - ${ROOT_DIR}/python:/app/python
+      - ${ROOT_DIR}/robot_ik:/app/robot_ik
+      - ${ROOT_DIR}/oculus_reader:/app/oculus_reader
+      - ${ROOT_DIR}/parameters.py:/app/parameters.py
+      - ${ROOT_DIR}/recordings:/app/recordings
+    devices:
+      - "/dev:/dev"
+    runtime: nvidia
+    privileged: true
+    network_mode: "host"
+    extra_hosts:
+      - "nuc:${NUC_IP}"
+    command: sleep infinity

@@ -1,0 +1,29 @@
+[project]
+name = "franka_direct"
+requires-python = ">=3.8"
+dependencies = [
+    # gRPC
+    "grpcio",
+    "grpcio-tools",
+    "protobuf==3.20.1",
+    # numerics / vision
+    "numpy",
+    "scipy",
+    "opencv-python==4.6.0.66",
+    # IK solver deps (for simple_teleop_direct_torque.py)
+    "dm-control==1.0.5",
+    "mujoco==2.3.2",
+    # optional extras (for test_vr_readout.py)
+    "matplotlib",
+    # oculus_reader deps
+    "pure-python-adb",
+    "pyyaml",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends.legacy:build"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["robot_ik*", "python*"]
