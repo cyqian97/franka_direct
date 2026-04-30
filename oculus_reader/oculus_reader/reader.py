@@ -18,7 +18,7 @@ class OculusReader:
     def __init__(self,
             ip_address=None,
             port = 5555,
-            APK_name='com.rail.oculus.teleop',
+            APK_name='com.TAMU.Quest3Reader',
             print_FPS=False,
             run=True
         ):
@@ -36,7 +36,6 @@ class OculusReader:
             self.fps_counter = FPSCounter()
 
         self.device = self.get_device()
-        self.install(verbose=False)
         if run:
             self.run()
 
@@ -45,7 +44,7 @@ class OculusReader:
 
     def run(self):
         self.running = True
-        self.device.shell('am start -n "com.rail.oculus.teleop/com.rail.oculus.teleop.MainActivity" -a android.intent.action.MAIN -c android.intent.category.LAUNCHER')
+        self.device.shell('am start -n "com.TAMU.Quest3Reader/com.TAMU.Quest3Reader.MainActivity" -a android.intent.action.MAIN -c android.intent.category.LAUNCHER')
         self.thread = threading.Thread(target=self.device.shell, args=("logcat -T 0", self.read_logcat_by_line))
         self.thread.start()
 

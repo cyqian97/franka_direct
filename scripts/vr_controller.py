@@ -110,7 +110,7 @@ class VRController:
                 if self.controller_id in poses:
                     R = np.asarray(poses[self.controller_id])[:3, :3]
                     theta = np.arctan2(R[0, 1], R[1, 1])
-                    c, s = np.cos(theta), np.sin(theta)
+                    c, s = np.cos(-theta), np.sin(-theta)
                     self.vr_to_global_mat = np.array([
                         [ c,  s, 0, 0],
                         [-s,  c, 0, 0],
