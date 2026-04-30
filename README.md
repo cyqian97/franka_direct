@@ -75,6 +75,10 @@ franka_direct/
 │   ├── vr_controller.py            VRController: Quest 3 → pose deltas
 │   ├── simple_teleop_direct.py     Teleoperation via Cartesian server
 │   ├── simple_teleop_direct_torque.py  Teleoperation via joint torque + IK
+│   ├── data_recorder.py            HDF5 episode recorder (used by teleop script)
+│   ├── preprocess_franka_data.py   Resize images + split train/val
+│   ├── rlds_dataset/
+│   │   └── franka_fr3/             TFDS dataset builder (HDF5 → RLDS)
 │   ├── simple_joint_direct.py      Test: sinusoidal joint motion
 │   ├── simple_pose_direct.py       Test: move EE by a fixed delta
 │   ├── test_vr_readout.py          Test: print raw VR controller output
@@ -213,16 +217,16 @@ docker exec -it franka_direct_laptop \
 
 ### VR Controller
 
-| Input | Action |
-|---|---|
-| Hold **GRIP TRIGGER** | Enable robot movement |
-| **INDEX TRIGGER** | Proportional gripper (squeeze = close) |
-| **JOYSTICK press** | Recalibrate yaw orientation |
-| **A** (right) / **X** (left) | Start recording |
-| **B** (right) / **Y** (left) | Stop and save recording |
-| `r` + Enter | Reset VR state |
-| `q` + Enter | Quit |
-| Ctrl+C | Emergency stop |
+| Input | Without `--task` | With `--task` (data recording) |
+|---|---|---|
+| Hold **GRIP TRIGGER** | Enable robot movement | Enable robot movement |
+| **INDEX TRIGGER** | Proportional gripper | Proportional gripper |
+| **JOYSTICK press** | Recalibrate yaw orientation | Recalibrate yaw orientation |
+| **A** (right) / **X** (left) | Start video recording | Start episode recording |
+| **B** (right) / **Y** (left) | Stop and save video | Save episode + reset to home |
+| `r` + Enter | Reset VR state | Reset VR state |
+| `q` + Enter | Quit | Quit (saves in-progress episode) |
+| Ctrl+C | Emergency stop | Emergency stop (saves in-progress episode) |
 
 ### ZED camera recording (optional)
 
@@ -247,6 +251,164 @@ docker exec -it franka_direct_laptop python /app/scripts/simple_pose_direct.py -
 # Print raw VR controller output
 docker exec -it franka_direct_laptop python /app/scripts/test_vr_readout.py
 ```
+
+---
+
+## Data Recording for OpenVLA-OFT Fine-tuning
+
+The teleop script can record imitation-learning episodes to HDF5 files while
+you operate the robot. Each episode stores joint state, EEF pose, images (if
+cameras are attached), and two action representations — absolute joint targets
+and delta-EEF — so you can experiment with either action space without
+re-recording.
+
+### Step 1 — Record episodes
+
+Pass `--task` to enable HDF5 recording. Optionally add `--cam0`/`--cam1` for
+synchronized camera frames.
+
+```bash
+docker exec -it franka_direct_laptop \
+    python /app/scripts/simple_teleop_direct_torque.py \
+    --task "pick up the red cup" \
+    --cam0 <serial0> --cam1 <serial1> \
+    --data_dir /app/data/pick_up_cup
+```
+
+**Per-episode workflow:**
+
+1. The robot resets to home at startup.
+2. Press **A** to start recording an episode.
+3. Hold the **GRIP TRIGGER** and move the robot to complete the task.
+4. Press **B** to save the episode. The robot resets to home automatically.
+5. Repeat from step 2 for each new episode.
+6. Press `q` + Enter (or Ctrl+C) to quit. Any in-progress episode is saved.
+
+Each saved file is `data/<task_dir>/episode_XXXXXX.hdf5`.
+
+**HDF5 layout per episode:**
+
+```
+/observations/
+    qpos        [T, 7]   joint positions (rad)
+    qvel        [T, 7]   joint velocities (rad/s)
+    ee_pose     [T, 16]  O_T_EE column-major (m, base frame)
+    gripper     [T, 1]   normalized gripper [0=closed, 1=open]
+    images/
+        primary [T, H, W, 3]  RGB, 3rd-person camera
+        wrist   [T, H, W, 3]  RGB, wrist/secondary camera
+/action         [T, 8]   absolute joint targets (7) + gripper_norm (1)
+/action_eef     [T, 7]   delta EEF: pos_delta (3, m) + rot_vec (3, rad) + gripper_norm (1)
+@language_instruction    task description string
+@sim                     False
+```
+
+### Step 2 — Preprocess (resize images + split train/val)
+
+openvla-oft expects 256×256 images. This script resizes from the native ZED
+resolution and splits into `train/` and `val/` sub-directories.
+
+```bash
+python scripts/preprocess_franka_data.py \
+    --data_dir  data/pick_up_cup \
+    --out_dir   data/pick_up_cup_256 \
+    --percent_val 0.1 \
+    --img_size  256
+```
+
+### Step 3 — Build the RLDS dataset
+
+Convert the preprocessed HDF5 files to TensorFlow Datasets (RLDS) format,
+which is what openvla-oft's data loader consumes.
+
+```bash
+# Point the builder at your preprocessed directory and desired output path
+FRANKA_FR3_DATA_DIR=data/pick_up_cup_256 \
+python scripts/rlds_dataset/franka_fr3/franka_fr3_dataset_builder.py \
+    --preprocessed_dir data/pick_up_cup_256 \
+    --out_dir          /path/to/rlds_datasets/
+```
+
+This writes a TFDS dataset named `franka_fr3` under `/path/to/rlds_datasets/`.
+Run it once; subsequent fine-tuning runs load directly from RLDS.
+
+---
+
+## OpenVLA-OFT Fine-tuning
+
+After the RLDS dataset is built, fine-tune using the
+[openvla-oft](https://github.com/moojink/openvla-oft) repo. Both action spaces
+recorded above are registered and ready to use.
+
+| Dataset name | Action space | When to use |
+|---|---|---|
+| `franka_fr3` | Absolute joint targets (8D) | Default; no accumulation at inference |
+| `franka_fr3_eef` | Delta EEF pos+rot (7D) | If you want EEF-space generalization |
+
+The openvla-oft repo (`~/cyqian/openvla-oft`) already has the required entries
+in `configs.py`, `transforms.py`, `mixtures.py`, `materialize.py`, and
+`constants.py`. No further changes to that repo are needed.
+
+### Fine-tune with joint-position actions (recommended)
+
+```bash
+cd ~/cyqian/openvla-oft
+
+torchrun --standalone --nnodes 1 --nproc-per-node <NUM_GPUS> \
+    vla-scripts/finetune.py \
+    --vla_path            openvla/openvla-7b \
+    --data_root_dir       /path/to/rlds_datasets/ \
+    --dataset_name        franka_fr3 \
+    --run_root_dir        /path/to/checkpoints/ \
+    --use_l1_regression   True \
+    --use_diffusion       False \
+    --use_film            True \
+    --num_images_in_input 2 \
+    --use_proprio         True \
+    --batch_size          4 \
+    --learning_rate       5e-4 \
+    --num_steps_before_decay 50000 \
+    --max_steps           100005 \
+    --use_val_set         True \
+    --val_freq            10000 \
+    --save_freq           10000 \
+    --image_aug           True \
+    --lora_rank           32 \
+    --wandb_entity        "<YOUR_ENTITY>" \
+    --wandb_project       "<YOUR_PROJECT>"
+```
+
+`--num_images_in_input 2` uses both the primary and wrist camera images. Set to
+`1` if you recorded without cameras (state-only) or want to use only the
+primary view.
+
+### Fine-tune with delta-EEF actions
+
+Same command, replace `--dataset_name franka_fr3` with `--dataset_name franka_fr3_eef`.
+The normalization scheme switches automatically to `BOUNDS_Q99` (relative
+actions benefit from outlier clipping).
+
+### Deployment
+
+After fine-tuning, deploy the model as a gRPC server and query it from the
+laptop container. The `unnorm_key` must match the dataset name used during
+training:
+
+```bash
+# On the GPU machine — serve the fine-tuned checkpoint
+python vla-scripts/deploy.py \
+    --pretrained_checkpoint /path/to/checkpoints/<run_id>/... \
+    --use_l1_regression     True \
+    --use_film              True \
+    --num_images_in_input   2 \
+    --use_proprio           True \
+    --center_crop           True \
+    --unnorm_key            franka_fr3
+```
+
+Then run inference from the laptop container using
+`vla-scripts/openvla_oft_franka_client.py` (see that script's docstring for
+argument details).
 
 ---
 

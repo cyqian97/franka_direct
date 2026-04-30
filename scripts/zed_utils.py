@@ -168,9 +168,14 @@ class CameraRecorder:
 
         Call this once per control loop iteration to keep camera output
         frame-locked to the robot control rate.
+
+        The latest BGR frames are cached as self.last_frame0 / self.last_frame1
+        for use by other recorders (e.g. HDF5 data recorder).
         """
         f0 = grab_bgr(self._zed0, self._rt0)
         f1 = grab_bgr(self._zed1, self._rt1)
+        self.last_frame0 = f0   # BGR, shape [H, W, 3] or None
+        self.last_frame1 = f1
         with self._lock:
             if self._recording and f0 is not None and f1 is not None:
                 self._writers[0].write(f0)

@@ -1,0 +1,6 @@
+- I dont't need this:  On Ctrl+C/quit: any unsaved in-progress episode is automatically saved. 
+- I want to start a new recording once the side trigger is pressed (arm start moving), and save when it is released. No stopping in each recording
+- I want to use A and B to mark the trajectory as success or failure, and save them with different suffix
+- I want to have a yaml config file to configure parameters  used to record data, e.g. text instruction, frame rate, VR control gain. I also want to control the camera modes in this file (resolution, fps).
+- Have live camera windows show up while teleoperating (if it will harm the data recording, then ignore this steep)
+- For the raw data directly from the recording, I want both rgb images and also the depth image

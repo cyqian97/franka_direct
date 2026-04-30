@@ -35,11 +35,17 @@ Controls:
   Hold GRIP TRIGGER    → enable robot movement
   INDEX TRIGGER        → proportional gripper (squeeze = close)
   JOYSTICK press       → recalibrate controller orientation
-  A (right) / X (left) → stop (success)
-  B (right) / Y (left) → stop (failure)
+  A (right) / X (left) → start episode recording  (or stop, success, if no recorder)
+  B (right) / Y (left) → save episode (success)   (or stop, failure,  if no recorder)
   r + Enter            → reset VR state
   q + Enter            → quit
   Ctrl+C               → emergency stop
+
+Data recording (enabled with --task):
+  Provide --task "description" to enable HDF5 episode recording.
+  A button → start a new episode
+  B button → save current episode and reset robot to home
+  Episodes are saved to --data_dir (default: data/) as episode_XXXXXX.hdf5.
 """
 
 import argparse
@@ -72,6 +78,7 @@ except ImportError as e:
     sys.exit(1)
 
 from zed_utils import CameraRecorder, ZED_AVAILABLE
+from data_recorder import DataRecorder
 
 from vr_controller import VRController
 
@@ -204,6 +211,12 @@ def main():
                    choices=["HD2K", "HD1080", "HD720", "VGA"])
     g.add_argument("--out_dir",    type=str, default="recordings",
                    help="Root directory for saved videos (default: recordings/)")
+
+    d = parser.add_argument_group("episode data recording for openvla-oft fine-tuning")
+    d.add_argument("--task",     type=str, default=None,
+                   help="Language instruction for the task (enables HDF5 recording)")
+    d.add_argument("--data_dir", type=str, default="data",
+                   help="Directory for HDF5 episode files (default: data/)")
     args = parser.parse_args()
 
     right_controller = not args.left
@@ -258,7 +271,14 @@ def main():
         print(f"[FAIL] Could not initialize VR controller: {e}")
         sys.exit(1)
 
-    # === Step 3.5: Initialize cameras (optional) ==============================
+    # === Step 3.5: Initialize data recorder (optional) =======================
+    data_rec = None
+    if args.task is not None:
+        data_rec = DataRecorder(out_dir=args.data_dir)
+        print(f"[OK] Data recorder initialized → {args.data_dir}/")
+        print(f"     Task: \"{args.task}\"")
+
+    # === Step 3.6: Initialize cameras (optional) ==============================
     recorder = None
     if args.cam0 is not None and args.cam1 is not None:
         if not ZED_AVAILABLE:
@@ -298,9 +318,12 @@ def main():
     print(f"  Hold GRIP TRIGGER    → move robot")
     print(f"  INDEX TRIGGER        → proportional gripper (squeeze = close)")
     print(f"  JOYSTICK press       → recalibrate orientation")
-    if recorder is not None:
-        print(f"  '{btn_a}'                  → start recording")
-        print(f"  '{btn_b}'                  → stop and save recording")
+    if data_rec is not None:
+        print(f"  '{btn_a}'                  → start episode recording")
+        print(f"  '{btn_b}'                  → save episode + reset to home")
+    elif recorder is not None:
+        print(f"  '{btn_a}'                  → start video recording")
+        print(f"  '{btn_b}'                  → stop and save video")
     print(f"  Ctrl+C               → emergency stop")
     print(f"  r + Enter            → reset VR state")
     print(f"  q + Enter            → quit")
@@ -309,10 +332,12 @@ def main():
     print()
 
     # === Step 6: Main control loop ============================================
-    step_count   = 0
-    robot_origin = None    # 4×4, captured when VR origin resets
-    prev_btn_a   = False
-    prev_btn_b   = False
+    step_count      = 0
+    robot_origin    = None    # 4×4, captured when VR origin resets
+    prev_btn_a      = False
+    prev_btn_b      = False
+    last_q_target   = None    # last commanded joint target (for recording hold steps)
+    last_eef_delta  = None    # last delta-EEF action [6] for recording
 
     GRIPPER_OPEN     = 0.08   # Franka Hand max width [m]
     GRIPPER_SPEED    = 0.1    # finger speed [m/s]
@@ -330,14 +355,20 @@ def main():
         # ── VR controller info ──────────────────────────────────────────────
         info = vr.get_info()
 
-        # ── Recording buttons (edge-detect to avoid repeat triggers) ────────
+        # ── Button handling (edge-detect to avoid repeat triggers) ──────────
         cur_a = info["success"]
         cur_b = info["failure"]
         if cur_a and not prev_btn_a:
             print(f"\n[BTN] {btn_a} pressed", end="")
-            if recorder is not None:
+            if data_rec is not None:
+                if not data_rec.is_recording:
+                    print(" → starting episode recording ...")
+                    data_rec.start_episode()
+                else:
+                    print(f" (already recording: {data_rec.num_steps} steps)")
+            elif recorder is not None:
                 if not recorder.is_recording:
-                    print(" → starting recording ...")
+                    print(" → starting video recording ...")
                     recorder.start()
                 else:
                     print(" (already recording)")
@@ -345,9 +376,28 @@ def main():
                 print(" (no recorder active)")
         if cur_b and not prev_btn_b:
             print(f"\n[BTN] {btn_b} pressed", end="")
-            if recorder is not None:
+            if data_rec is not None:
+                if data_rec.is_recording:
+                    if data_rec.num_steps > 0:
+                        print(f" → saving episode ({data_rec.num_steps} steps) ...")
+                        data_rec.save_episode(task=args.task)
+                    else:
+                        print(" → discarding empty episode")
+                        data_rec.discard_episode()
+                    # Reset to home between episodes
+                    print("   Resetting to home position ...")
+                    robot_origin = None
+                    vr.reset_state()
+                    last_q_target  = None
+                    last_eef_delta = None
+                    ok, msg = client.reset_to_joints(HOME_Q, speed=0.2)
+                    if not ok:
+                        print(f"   [WARN] Reset: {msg}")
+                else:
+                    print(" (not recording)")
+            elif recorder is not None:
                 if recorder.is_recording:
-                    print(" → stopping recording ...")
+                    print(" → stopping video recording ...")
                     recorder.stop()
                 else:
                     print(" (not recording)")
@@ -419,6 +469,11 @@ def main():
                 # 4. New joint target = current q + IK delta.
                 q_target = (np.array(state["q"]) + joint_delta).tolist()
                 client.set_joint_target(q_target)
+                last_q_target = q_target
+
+                # 5. Delta-EEF action: [pos_delta (m), rot_vec (rad)].
+                rot_vec = rotation_error_vec(rot_delta, np.eye(3))
+                last_eef_delta = np.concatenate([pos_delta, rot_vec])
 
                 # Tracking errors for status display
                 pos_err_mm  = np.linalg.norm(T_target[:3, 3] - T_current[:3, 3]) * 1000.0
@@ -439,6 +494,22 @@ def main():
             client.set_gripper_target(gripper_target, GRIPPER_SPEED)
             last_gripper_cmd = gripper_target
 
+        # ── Record step (if episode recording active) ───────────────────────
+        if data_rec is not None and data_rec.is_recording:
+            step_q_target  = last_q_target if last_q_target is not None else state["q"]
+            step_grip_norm = last_gripper_cmd / GRIPPER_OPEN
+            # last_eef_delta is None before first motion; zero = hold position
+            step_eef_delta = last_eef_delta if last_eef_delta is not None \
+                             else np.zeros(6)
+            img_p = img_w = None
+            if recorder is not None:
+                img_p = getattr(recorder, "last_frame0", None)
+                img_w = getattr(recorder, "last_frame1", None)
+            data_rec.record_step(state, step_q_target, step_grip_norm,
+                                 step_eef_delta, img_p, img_w)
+            # eef delta is only non-zero on the step it's commanded; reset each tick
+            last_eef_delta = None
+
         # ── Regulate frequency ──────────────────────────────────────────────
         elapsed = time.time() - loop_start
         sleep_t = loop_period - elapsed
@@ -452,6 +523,13 @@ def main():
     # === Cleanup ==============================================================
     print("\nTeleoperation ended.")
     print(f"Total steps: {step_count}")
+    if data_rec is not None and data_rec.is_recording:
+        n = data_rec.num_steps
+        if n > 0:
+            print(f"[REC] Unsaved episode ({n} steps) — saving on exit ...")
+            data_rec.save_episode(task=args.task)
+        else:
+            data_rec.discard_episode()
     if recorder is not None:
         recorder.close()   # saves any in-progress recording, closes cameras
     try:

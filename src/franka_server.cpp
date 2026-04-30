@@ -311,6 +311,18 @@ struct SharedState {
     bool   ready{false};
     std::string error{};
 
+    // Extended libfranka RobotState fields (proto fields 11-29)
+    std::array<double, 16> O_T_EE_d{};
+    std::array<double, 7>  q_d{}, dq_d{}, ddq_d{};
+    std::array<double, 7>  tau_J{}, tau_J_d{}, dtau_J{}, tau_ext_hat_filtered{};
+    std::array<double, 6>  O_F_ext_hat_K{}, K_F_ext_hat_K{};
+    std::array<double, 7>  joint_contact{}, joint_collision{};
+    std::array<double, 6>  cartesian_contact{}, cartesian_collision{};
+    std::array<double, 7>  theta{}, dtheta{};
+    std::array<double, 2>  elbow{};
+    int32_t                robot_mode{0};
+    double                 time_s{0.0};
+
     // Atomic flags — safe to read/write without mutex.
     std::atomic<bool> stop{false};
 
@@ -379,6 +391,25 @@ public:
             rep->set_cmd_success_rate(s_.cmd_success_rate);
             rep->set_ready(s_.ready);
             rep->set_error(s_.error);
+            for (double v : s_.O_T_EE_d)             rep->add_o_t_ee_d(v);
+            for (double v : s_.q_d)                  rep->add_q_d(v);
+            for (double v : s_.dq_d)                 rep->add_dq_d(v);
+            for (double v : s_.ddq_d)                rep->add_ddq_d(v);
+            for (double v : s_.tau_J)                rep->add_tau_j(v);
+            for (double v : s_.tau_J_d)              rep->add_tau_j_d(v);
+            for (double v : s_.dtau_J)               rep->add_dtau_j(v);
+            for (double v : s_.tau_ext_hat_filtered) rep->add_tau_ext_hat_filtered(v);
+            for (double v : s_.O_F_ext_hat_K)        rep->add_o_f_ext_hat_k(v);
+            for (double v : s_.K_F_ext_hat_K)        rep->add_k_f_ext_hat_k(v);
+            for (double v : s_.joint_contact)        rep->add_joint_contact(v);
+            for (double v : s_.cartesian_contact)    rep->add_cartesian_contact(v);
+            for (double v : s_.joint_collision)      rep->add_joint_collision(v);
+            for (double v : s_.cartesian_collision)  rep->add_cartesian_collision(v);
+            for (double v : s_.theta)                rep->add_theta(v);
+            for (double v : s_.dtheta)               rep->add_dtheta(v);
+            for (double v : s_.elbow)                rep->add_elbow(v);
+            rep->set_robot_mode(s_.robot_mode);
+            rep->set_time_s(s_.time_s);
         }
         // Gripper state — separate mutex, never hold both at once
         {
@@ -670,6 +701,25 @@ int main(int argc, char** argv) {
                     state.current_dq       = rs.dq;
                     state.cmd_success_rate = rs.control_command_success_rate;
                     state.target_q         = interp_q;
+                    state.O_T_EE_d             = rs.O_T_EE_d;
+                    state.q_d                  = rs.q_d;
+                    state.dq_d                 = rs.dq_d;
+                    state.ddq_d                = rs.ddq_d;
+                    state.tau_J                = rs.tau_J;
+                    state.tau_J_d              = rs.tau_J_d;
+                    state.dtau_J               = rs.dtau_J;
+                    state.tau_ext_hat_filtered = rs.tau_ext_hat_filtered;
+                    state.O_F_ext_hat_K        = rs.O_F_ext_hat_K;
+                    state.K_F_ext_hat_K        = rs.K_F_ext_hat_K;
+                    state.joint_contact        = rs.joint_contact;
+                    state.cartesian_contact    = rs.cartesian_contact;
+                    state.joint_collision      = rs.joint_collision;
+                    state.cartesian_collision  = rs.cartesian_collision;
+                    state.theta                = rs.theta;
+                    state.dtheta               = rs.dtheta;
+                    state.elbow                = rs.elbow;
+                    state.robot_mode           = static_cast<int32_t>(rs.robot_mode);
+                    state.time_s               = rs.time.toSec();
 
                     // ── Exit if stop or reset requested ───────────────────
                     if (state.stop || state.reset_requested.load()) {

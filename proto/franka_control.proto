@@ -47,16 +47,38 @@ message JointResetTarget {
 }
 
 message RobotState {
-    repeated double pose          = 1;   // O_T_EE col-major (16 doubles) — actual measured pose
-    repeated double q             = 2;   // joint positions (7 doubles) — actual measured
-    double cmd_success_rate       = 3;   // libfranka control_command_success_rate
+    // ── Fields originally in this proto ──────────────────────────────────────
+    repeated double pose          = 1;   // O_T_EE col-major (16) — actual measured EEF pose
+    repeated double q             = 2;   // measured joint positions (7) [rad]
+    double cmd_success_rate       = 3;   // libfranka control_command_success_rate [0,1]
     bool   ready                  = 4;   // true once arm control loop is running
     string error                  = 5;   // non-empty if fatal error
-    repeated double target_q      = 6;   // current interpolated joint command (7 doubles)
+    repeated double target_q      = 6;   // server interpolated joint command (7) [rad]
     double gripper_width          = 7;   // actual gripper opening [m]
-    bool   gripper_grasping       = 8;   // true while gripping an object
-    repeated double target_pose   = 9;   // current commanded EE pose (16 doubles)
-    repeated double dq            = 10;  // joint velocities (7 doubles) — actual measured
+    bool   gripper_grasping       = 8;   // true while gripping
+    repeated double target_pose   = 9;   // (unused — always empty)
+    repeated double dq            = 10;  // measured joint velocities (7) [rad/s]
+
+    // ── Full libfranka RobotState fields ──────────────────────────────────────
+    repeated double O_T_EE_d               = 11;  // last desired EEF pose, col-major (16)
+    repeated double q_d                    = 12;  // desired joint positions (7) [rad]
+    repeated double dq_d                   = 13;  // desired joint velocities (7) [rad/s]
+    repeated double ddq_d                  = 14;  // desired joint accelerations (7) [rad/s²]
+    repeated double tau_J                  = 15;  // measured link-side joint torques (7) [Nm]
+    repeated double tau_J_d                = 16;  // desired joint torques w/o gravity (7) [Nm]
+    repeated double dtau_J                 = 17;  // torque derivative (7) [Nm/s]
+    repeated double tau_ext_hat_filtered   = 18;  // filtered external torque estimate (7) [Nm]
+    repeated double O_F_ext_hat_K          = 19;  // estimated external wrench in base frame (6) [N,Nm]
+    repeated double K_F_ext_hat_K          = 20;  // estimated external wrench in stiffness frame (6) [N,Nm]
+    repeated double joint_contact          = 21;  // contact level per joint (7)
+    repeated double cartesian_contact      = 22;  // contact level per Cartesian dim (6)
+    repeated double joint_collision        = 23;  // collision level per joint (7)
+    repeated double cartesian_collision    = 24;  // collision level per Cartesian dim (6)
+    repeated double theta                  = 25;  // motor positions (7) [rad]
+    repeated double dtheta                 = 26;  // motor velocities (7) [rad/s]
+    repeated double elbow                  = 27;  // elbow config: [joint3_pos, flip_dir] (2)
+    int32           robot_mode             = 28;  // RobotMode enum: 0=Other,1=Idle,2=Move,3=Guiding,4=Reflex,5=UserStopped,6=AutoErrorRecovery
+    double          time_s                 = 29;  // robot timestamp [s], monotonically increasing
 }
 
 message CommandResult {
