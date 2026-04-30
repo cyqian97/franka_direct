@@ -158,7 +158,11 @@ the motion generator entirely.
 transformed = global_to_env_mat @ vr_to_global_mat @ raw
 ```
 - `vr_to_global_mat`: set at joystick press — full `inv(raw)` to zero out the
-  current controller pose; continuously updated at startup until grip is held
+  current controller pose; continuously updated at startup until grip is held.
+  On joystick press, yaw-only reset: `theta = arctan2(R[0,1], R[1,1])` (body Y
+  yaw from global Y), then `c, s = cos(-theta), sin(-theta)` — note **negated**
+  angle — producing Rz(+θ), which rotates the frame by +θ to align body Y with
+  the new frame Y. Z (vertical) is untouched.
 - `global_to_env_mat`: signed permutation matrix from `rmat_reorder` argument
   (default `(-2, -1, -3, 4)` — matches original DROID VRPolicy axis mapping)
 - `spatial_coeff`: scalar multiplier on position delta (default 1.0)
