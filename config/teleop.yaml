@@ -1,0 +1,32 @@
+# franka_direct teleoperation configuration
+# Edit this file and run: python scripts/simple_teleop_direct_torque.py --config config/teleop.yaml
+
+# Language instruction stored with every recorded episode
+task: ""
+
+# Output directory for HDF5 episodes
+data_dir: data
+
+# Robot gRPC server
+host: 192.168.1.6
+port: 50052
+
+# Control loop frequency (Hz)
+hz: 15
+
+# VR controller
+left_controller: false
+spatial_coeff: 1.0        # position delta multiplier (larger = faster arm motion)
+
+# Skip robot reset to home on startup
+no_reset: false
+
+# ZED camera settings (set enabled: true to record camera data)
+camera:
+  enabled: false
+  serial0: null            # null = auto-detect first ZED camera
+  serial1: null            # null = auto-detect second ZED camera
+  fps: 15
+  resolution: HD720        # HD2K | HD1080 | HD720 | VGA
+  depth: false             # also record depth images (float32, metres)
+  preview: true            # show live OpenCV preview windows while teleoperating

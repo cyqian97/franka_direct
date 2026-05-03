@@ -133,7 +133,8 @@ class FrankaDirectClient:
         Args:
             width_m:   target opening in metres, range [0, 0.08].
                        0.0 = fully closed, 0.08 = fully open.
-            speed_mps: max finger speed in m/s, range [0.01, 0.2].
+            speed_mps: ignored — the server uses gripper_speed from
+                       config/controller.yaml instead.
         Returns:
             (success: bool, message: str)
         """

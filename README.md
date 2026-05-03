@@ -228,6 +228,64 @@ docker exec -it franka_direct_laptop \
 | `q` + Enter | Quit | Quit (saves in-progress episode) |
 | Ctrl+C | Emergency stop | Emergency stop (saves in-progress episode) |
 
+### Gripper Control
+
+The gripper is controlled by the **index trigger** (front of controller), not the grip trigger (side).
+
+**VR trigger types**
+
+The OculusReader APK exposes two versions of each trigger:
+
+| Key | Type | Used for |
+|---|---|---|
+| `RG` / `LG` | **bool** | Grip trigger — enables arm movement (on/off) |
+| `rightGrip` / `leftGrip` | **float** 0–1 | Grip trigger analog — available but unused |
+| `RTr` / `LTr` | **bool** | Index trigger threshold — unused |
+| `rightTrig` / `leftTrig` | **float** 0–1 | Index trigger analog — controls gripper |
+
+The index trigger returns a continuous float, so the gripper has proportional control:
+- Trigger fully released → gripper fully open (80 mm)
+- Trigger fully squeezed → gripper fully closed (0 mm)
+
+**Control path**
+
+```
+index_trig ∈ [0, 1]  (float, 15 Hz)
+  → gripper_target = (1 − index_trig) × 0.08 m
+  → deadband filter: only send gRPC if |change| > 2 mm
+  → SetGripperTarget gRPC  (returns immediately, non-blocking)
+  → C++ gripper thread (separate from 1 kHz RT arm loop)
+      width > 40 mm → gripper.move(width, speed)    — open/position mode
+      width ≤ 40 mm → gripper.grasp(width, speed,   — grasp mode
+                           force=20 N, ε=0.08 m)
+  → Franka Hand fingers
+```
+
+The gripper runs in a dedicated thread completely independent of the 1 kHz arm RT loop. `gripper.move()` and `gripper.grasp()` are blocking calls — the thread waits until the fingers reach position before accepting a new command. If a new `SetGripperTarget` arrives while a move is in progress, it is queued and executed immediately after.
+
+**move vs grasp**
+
+Below 40 mm the server switches from `move()` to `grasp()`. `grasp()` applies a
+configurable closing force (default 20 N) and succeeds even if an object stops the
+fingers early (tolerances set to ±80 mm). `move()` targets an exact width with no
+extra force. The thresholds and force are tunable in `config/controller.yaml`:
+
+```yaml
+gripper_force:   20.0   # closing force [N]
+gripper_eps_in:   0.08  # grasp epsilon_inner [m]
+gripper_eps_out:  0.08  # grasp epsilon_outer [m]
+```
+
+**Recorded data**
+
+| Field | Value |
+|---|---|
+| `action[-1]` | `last_sent_command / 0.08` — commanded normalized width (policy action) |
+| `observations/gripper` | `measured_width / 0.08` — actual normalized width (sensor) |
+
+Both are normalized to [0 = closed, 1 = open]. They differ when the deadband
+suppresses a command or when the gripper is blocked by an object.
+
 ### ZED camera recording (optional)
 
 ```bash

@@ -1,0 +1,20 @@
+# franka_direct dataset processing configuration
+# Edit this file and run: python scripts/build_rlds.py --config config/process.yaml
+
+# Raw HDF5 episodes recorded by simple_teleop_direct_torque.py
+data_dir: data/my_task
+
+# Final RLDS/TFDS dataset output directory (used by openvla-oft)
+rlds_dir: data/my_task_rlds
+
+# Intermediate preprocessed HDF5 directory (auto-derived as rlds_dir + "_prep" if omitted)
+# prep_dir: data/my_task_prep
+
+# Image resize for openvla-oft training (standard: 256x256)
+img_size: 256
+
+# Fraction of episodes held out for validation
+percent_val: 0.1
+
+# Random seed for reproducible train/val split
+seed: 42

@@ -83,6 +83,7 @@ struct ControllerConfig {
     double max_step        = 0.001;  // rad per 1 kHz tick
     double lpf_cutoff      = 100.0;  // torque output low-pass filter cutoff [Hz]
     double gripper_force   =  20.0;  // grasp force [N]
+    double gripper_speed   =   0.1;  // finger speed [m/s]
     double gripper_eps_in  =  0.08;  // grasp epsilon_inner [m]
     double gripper_eps_out =  0.08;  // grasp epsilon_outer [m]
 };
@@ -131,6 +132,7 @@ static ControllerConfig load_config(const std::string& path) {
         else if (key == "max_step")        cfg.max_step        = std::stod(val);
         else if (key == "lpf_cutoff")      cfg.lpf_cutoff      = std::stod(val);
         else if (key == "gripper_force")   cfg.gripper_force   = std::stod(val);
+        else if (key == "gripper_speed")   cfg.gripper_speed   = std::stod(val);
         else if (key == "gripper_eps_in")  cfg.gripper_eps_in  = std::stod(val);
         else if (key == "gripper_eps_out") cfg.gripper_eps_out = std::stod(val);
         // unknown keys silently ignored
@@ -343,7 +345,9 @@ struct SharedState {
 
 class FrankaControlImpl final : public franka_control::FrankaControl::Service {
 public:
-    explicit FrankaControlImpl(SharedState& s, GripperSharedState& gs) : s_(s), gs_(gs) {}
+    explicit FrankaControlImpl(SharedState& s, GripperSharedState& gs,
+                               const ControllerConfig& cfg)
+        : s_(s), gs_(gs), cfg_(cfg) {}
 
     Status SetJointTarget(ServerContext*,
                           const franka_control::JointTarget* req,
@@ -370,7 +374,7 @@ public:
         {
             std::lock_guard<std::mutex> lk(gs_.mtx);
             gs_.desired_width = std::max(0.0, std::min(req->width(), 0.08));
-            gs_.desired_speed = req->speed() > 0.0 ? req->speed() : 0.1;
+            gs_.desired_speed = cfg_.gripper_speed;
             ++gs_.cmd_seq;
         }
         gs_.cv.notify_one();
@@ -470,16 +474,18 @@ public:
     }
 
 private:
-    SharedState&        s_;
-    GripperSharedState& gs_;
+    SharedState&              s_;
+    GripperSharedState&       gs_;
+    const ControllerConfig&   cfg_;
 };
 
 // ── gRPC server launcher (runs in background thread) ───────────────────────
 
 static std::unique_ptr<Server> g_server;
 
-void run_grpc_server(SharedState& state, GripperSharedState& gs, const std::string& addr) {
-    FrankaControlImpl service(state, gs);
+void run_grpc_server(SharedState& state, GripperSharedState& gs,
+                     const ControllerConfig& cfg, const std::string& addr) {
+    FrankaControlImpl service(state, gs, cfg);
     ServerBuilder builder;
     builder.AddListeningPort(addr, grpc::InsecureServerCredentials());
     builder.RegisterService(&service);
@@ -561,7 +567,7 @@ int main(int argc, char** argv) {
     gripper_thread.detach();
 
     // ── Start gRPC server in background thread ──────────────────────────────
-    std::thread grpc_thread([&]() { run_grpc_server(state, gripper_state, grpc_addr); });
+    std::thread grpc_thread([&]() { run_grpc_server(state, gripper_state, cfg, grpc_addr); });
     grpc_thread.detach();
 
     // ── Connect to robot and load dynamics model ────────────────────────────

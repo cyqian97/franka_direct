@@ -6,14 +6,12 @@ grab() is meant to be called once per control loop iteration so that
 camera frames are frame-locked to the robot control rate.
 
 Typical usage:
-    rec = CameraRecorder(serial0=12345, serial1=67890, fps=15)
+    rec = CameraRecorder(serial0=12345, serial1=67890, fps=15,
+                         depth=True, preview=True)
     rec.open()
 
     # inside control loop:
-    rec.grab()          # grabs + writes if recording
-
-    rec.start()         # begin recording (A button)
-    rec.stop()          # stop and save (B button)
+    rec.grab()          # grabs frames (+ depth, + preview windows if enabled)
 
     rec.close()         # on exit
 """
@@ -33,17 +31,18 @@ except ImportError:
     ZED_AVAILABLE = False
 
 
-# ── Low-level helpers (used by CameraRecorder and by openvla_oft_franka_client) ──
+# ── Low-level helpers ─────────────────────────────────────────────────────────
 
 def list_cameras() -> list:
-    """Return a list of dicts with serial/model info for all detected ZED cameras."""
+    """Return list of dicts with serial/model info for all detected ZED cameras."""
     if not ZED_AVAILABLE:
         return []
     device_list = sl.Camera.get_device_list()
     return [{"serial": d.serial_number, "model": str(d.camera_model)} for d in device_list]
 
 
-def open_camera(serial: Optional[int], fps: int, resolution: str, label: str = ""):
+def open_camera(serial: Optional[int], fps: int, resolution: str,
+                label: str = "", enable_depth: bool = False):
     """Open one ZED camera. Returns (sl.Camera, sl.RuntimeParameters)."""
     if not ZED_AVAILABLE:
         raise RuntimeError("pyzed not installed.")
@@ -57,7 +56,11 @@ def open_camera(serial: Optional[int], fps: int, resolution: str, label: str = "
     params = sl.InitParameters()
     params.camera_resolution = res_map.get(resolution, sl.RESOLUTION.HD720)
     params.camera_fps = fps
-    params.depth_mode = sl.DEPTH_MODE.NONE
+    if enable_depth:
+        params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
+        params.coordinate_units = sl.UNIT.METER
+    else:
+        params.depth_mode = sl.DEPTH_MODE.NONE
     if serial is not None:
         params.set_from_serial_number(serial)
     status = zed.open(params)
@@ -67,17 +70,30 @@ def open_camera(serial: Optional[int], fps: int, resolution: str, label: str = "
         raise RuntimeError(f"Failed to open ZED{tag}{sn}: {status}")
     sn_actual = zed.get_camera_information().serial_number
     tag = f" [{label}]" if label else ""
-    print(f"[OK] ZED{tag} opened  serial={sn_actual}  {resolution} @ {fps} fps")
+    depth_tag = " +depth" if enable_depth else ""
+    print(f"[OK] ZED{tag} opened  serial={sn_actual}  {resolution} @ {fps} fps{depth_tag}")
     return zed, sl.RuntimeParameters()
+
+
+def _retrieve_bgr(zed) -> np.ndarray:
+    """Retrieve the latest LEFT-eye BGR frame (call after zed.grab())."""
+    mat = sl.Mat()
+    zed.retrieve_image(mat, sl.VIEW.LEFT)
+    return mat.get_data()[:, :, :3].copy()
+
+
+def _retrieve_depth(zed) -> np.ndarray:
+    """Retrieve the latest depth map in metres (float32, H×W). NaN = invalid."""
+    mat = sl.Mat()
+    zed.retrieve_measure(mat, sl.MEASURE.DEPTH)
+    return mat.get_data().copy()
 
 
 def grab_bgr(zed, runtime) -> Optional[np.ndarray]:
     """Grab one LEFT-eye BGR frame. Returns (H, W, 3) ndarray or None."""
     if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
         return None
-    mat = sl.Mat()
-    zed.retrieve_image(mat, sl.VIEW.LEFT)
-    return mat.get_data()[:, :, :3].copy()
+    return _retrieve_bgr(zed)
 
 
 # ── CameraRecorder ────────────────────────────────────────────────────────────
@@ -87,24 +103,28 @@ class CameraRecorder:
 
     Frame rate of the saved video equals the rate at which grab() is called,
     which keeps the recording frame-locked to the robot control loop.
-    The fps argument sets the ZED hardware capture rate (should be >= control hz)
-    and the VideoWriter fps (used as the playback speed of the saved file).
 
     Parameters
     ----------
     serial0, serial1 : int or None
-        ZED camera serial numbers. None = first/second detected.
+        ZED camera serial numbers. None = first/second auto-detected.
     fps : int
         Camera hardware capture rate and VideoWriter playback fps.
     resolution : str
         One of HD2K, HD1080, HD720, VGA.
     out_dir : str
-        Root directory; each recording goes into a timestamped subdirectory.
+        Root directory; each MP4 recording goes into a timestamped subdirectory.
+    depth : bool
+        If True, also grab depth images (float32, metres). Exposed via
+        last_depth0 / last_depth1 for downstream storage (e.g. HDF5).
+    preview : bool
+        If True, show live OpenCV windows for both cameras during grab().
     """
 
     def __init__(self, serial0: Optional[int], serial1: Optional[int],
                  fps: int = 60, resolution: str = "HD720",
-                 out_dir: str = "scripts/recordings"):
+                 out_dir: str = "scripts/recordings",
+                 depth: bool = False, preview: bool = False):
         if not ZED_AVAILABLE:
             raise RuntimeError("pyzed not installed — cannot use CameraRecorder.")
         self._serial0   = serial0
@@ -112,6 +132,8 @@ class CameraRecorder:
         self._fps       = fps
         self._res       = resolution
         self._out_dir   = out_dir
+        self._depth     = depth
+        self._preview   = preview
 
         self._zed0 = self._zed1 = None
         self._rt0  = self._rt1  = None
@@ -121,7 +143,16 @@ class CameraRecorder:
         self._writers    = []
         self._paths      = []
         self._n_frames   = 0
-        self._lock       = threading.Lock()  # protects _recording + _writers
+        self._lock       = threading.Lock()
+
+        # Latest frames (BGR ndarray or None) — read by HDF5 recorder each step
+        self.last_frame0: Optional[np.ndarray] = None
+        self.last_frame1: Optional[np.ndarray] = None
+        # Latest depth maps (float32 H×W or None)
+        self.last_depth0: Optional[np.ndarray] = None
+        self.last_depth1: Optional[np.ndarray] = None
+
+        self._preview_ok = preview   # set False if display init fails
 
     # ── Setup / teardown ──────────────────────────────────────────────────────
 
@@ -135,8 +166,10 @@ class CameraRecorder:
         else:
             print("[ZED] No cameras detected by sl.Camera.get_device_list()")
 
-        self._zed0, self._rt0 = open_camera(self._serial0, self._fps, self._res, "cam0")
-        self._zed1, self._rt1 = open_camera(self._serial1, self._fps, self._res, "cam1")
+        self._zed0, self._rt0 = open_camera(self._serial0, self._fps, self._res,
+                                             "cam0", enable_depth=self._depth)
+        self._zed1, self._rt1 = open_camera(self._serial1, self._fps, self._res,
+                                             "cam1", enable_depth=self._depth)
 
         print("[ZED] Warming up cameras (waiting for first frame)...")
         f0 = f1 = None
@@ -160,27 +193,48 @@ class CameraRecorder:
             self._zed0.close()
         if self._zed1 is not None:
             self._zed1.close()
+        if self._preview_ok:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
 
     # ── Per-loop call ─────────────────────────────────────────────────────────
 
     def grab(self):
-        """Grab one frame from each camera and write to video if recording.
+        """Grab one frame (and optionally depth) from each camera.
 
-        Call this once per control loop iteration to keep camera output
-        frame-locked to the robot control rate.
-
-        The latest BGR frames are cached as self.last_frame0 / self.last_frame1
-        for use by other recorders (e.g. HDF5 data recorder).
+        Call once per control loop iteration. Updates last_frame0/1 and
+        last_depth0/1. Writes to video if recording. Shows preview if enabled.
         """
-        f0 = grab_bgr(self._zed0, self._rt0)
-        f1 = grab_bgr(self._zed1, self._rt1)
-        self.last_frame0 = f0   # BGR, shape [H, W, 3] or None
+        ok0 = self._zed0.grab(self._rt0) == sl.ERROR_CODE.SUCCESS
+        ok1 = self._zed1.grab(self._rt1) == sl.ERROR_CODE.SUCCESS
+
+        f0 = _retrieve_bgr(self._zed0) if ok0 else None
+        f1 = _retrieve_bgr(self._zed1) if ok1 else None
+        d0 = _retrieve_depth(self._zed0) if (ok0 and self._depth) else None
+        d1 = _retrieve_depth(self._zed1) if (ok1 and self._depth) else None
+
+        self.last_frame0 = f0
         self.last_frame1 = f1
+        self.last_depth0 = d0
+        self.last_depth1 = d1
+
         with self._lock:
             if self._recording and f0 is not None and f1 is not None:
                 self._writers[0].write(f0)
                 self._writers[1].write(f1)
                 self._n_frames += 1
+
+        if self._preview_ok:
+            try:
+                if f0 is not None:
+                    cv2.imshow("cam0", f0)
+                if f1 is not None:
+                    cv2.imshow("cam1", f1)
+                cv2.waitKey(1)
+            except Exception:
+                self._preview_ok = False   # disable if display unavailable
 
     # ── Recording control ─────────────────────────────────────────────────────
 
@@ -207,10 +261,7 @@ class CameraRecorder:
             print(f"  [REC] → {p}")
 
     def stop(self):
-        """Stop recording, flush and close video files.
-
-        Returns (n_frames, paths).
-        """
+        """Stop recording, flush and close video files. Returns (n_frames, paths)."""
         with self._lock:
             if not self._recording:
                 return 0, []

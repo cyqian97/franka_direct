@@ -37,6 +37,7 @@ lpf_cutoff: 100.0
 # gripper_eps_in  [m]   : how much narrower than target is OK (inner tolerance)
 # gripper_eps_out [m]   : how much wider  than target is OK (outer tolerance)
 # Large epsilons mean grasp() succeeds whether or not an object is present.
-gripper_force:   20.0
+gripper_force:   10.0
+gripper_speed:    0.1   # finger speed [m/s], range [0.01, 0.2]
 gripper_eps_in:  0.08
 gripper_eps_out: 0.08

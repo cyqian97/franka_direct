@@ -8,44 +8,19 @@ Pipeline:
   → joint delta Δq → q_target → FrankaDirectClient (gRPC)
   → franka_server.cpp (1 kHz joint impedance torque loop)
 
-IK details:
-  - Uses dm_robotics Cartesian6dVelocityEffector with a MuJoCo FR3 model.
-  - Jacobian-based velocity IK with Tikhonov regularisation (λ=0.01),
-    joint position limit avoidance (0.3 rad margin), and weak nullspace
-    control toward q=0 (gain=0.025).
-  - Position error is capped at 75 mm/step; rotation at 0.15 rad/step.
-  - Runs at exactly 15 Hz (same rate as the original DROID VRPolicy).
-
-Gripper:
-  Proportional — index trigger value maps linearly to opening width.
-  Fully squeezed = 0 mm (closed), fully released = 80 mm (open).
-
-Prerequisites:
-  1. Build inside Docker:
-       docker exec <container> bash /app/droid/franka_direct/build.sh
-  2. Generate Python gRPC stubs (on the laptop):
-       bash python/generate_stubs.sh
-  3. Launch the torque server (do NOT run launch_robot.sh at the same time):
-       docker exec <container> bash /app/droid/franka_direct/launch_server.sh
-  4. Connect Oculus Quest 3 via USB; start the teleop APK manually.
-  5. Run this script:
-       python scripts/simple_teleop_direct_torque.py
+Recording:
+  All recording parameters are in config/teleop.yaml.
 
 Controls:
-  Hold GRIP TRIGGER    → enable robot movement
+  Hold GRIP TRIGGER    → move robot  +  auto-start episode recording
+  Release GRIP         → auto-save episode (with label) + reset to home
   INDEX TRIGGER        → proportional gripper (squeeze = close)
   JOYSTICK press       → recalibrate controller orientation
-  A (right) / X (left) → start episode recording  (or stop, success, if no recorder)
-  B (right) / Y (left) → save episode (success)   (or stop, failure,  if no recorder)
+  A / X                → mark current episode as SUCCESS
+  B / Y                → mark current episode as FAIL
   r + Enter            → reset VR state
   q + Enter            → quit
-  Ctrl+C               → emergency stop
-
-Data recording (enabled with --task):
-  Provide --task "description" to enable HDF5 episode recording.
-  A button → start a new episode
-  B button → save current episode and reset robot to home
-  Episodes are saved to --data_dir (default: data/) as episode_XXXXXX.hdf5.
+  Ctrl+C               → emergency stop (in-progress episode discarded)
 """
 
 import argparse
@@ -56,6 +31,7 @@ import sys
 import time
 
 import numpy as np
+import yaml
 
 # ── Path setup ───────────────────────────────────────────────────────────────
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -74,38 +50,51 @@ try:
     from robot_ik.robot_ik_solver import RobotIKSolver
 except ImportError as e:
     print(f"[ERROR] Could not import RobotIKSolver: {e}")
-    print("Make sure dm_robotics and dm_control are installed.")
     sys.exit(1)
 
 from zed_utils import CameraRecorder, ZED_AVAILABLE
 from data_recorder import DataRecorder
-
 from vr_controller import VRController
 
 
-# ── Pose math helpers ────────────────────────────────────────────────────────
+# ── Config loading ────────────────────────────────────────────────────────────
+
+def load_config(path: str) -> dict:
+    """Load teleop YAML config and return a flat dict with defaults applied."""
+    with open(path) as f:
+        d = yaml.safe_load(f) or {}
+    cam = d.get("camera", {})
+    return {
+        "task":             d.get("task", ""),
+        "data_dir":         d.get("data_dir", "data"),
+        "host":             d.get("host", "192.168.1.6"),
+        "port":             int(d.get("port", 50052)),
+        "hz":               int(d.get("hz", 15)),
+        "left_controller":  bool(d.get("left_controller", False)),
+        "spatial_coeff":    float(d.get("spatial_coeff", 1.0)),
+        "no_reset":         bool(d.get("no_reset", False)),
+        "cam_enabled":      bool(cam.get("enabled", False)),
+        "cam_serial0":      cam.get("serial0"),    # int or None
+        "cam_serial1":      cam.get("serial1"),
+        "cam_fps":          int(cam.get("fps", 15)),
+        "cam_resolution":   str(cam.get("resolution", "HD720")),
+        "cam_depth":        bool(cam.get("depth", False)),
+        "cam_preview":      bool(cam.get("preview", True)),
+    }
+
+
+# ── Pose math helpers ─────────────────────────────────────────────────────────
 
 def pose16_to_mat(pose16):
-    """Column-major 16 floats → 4×4 numpy array."""
     return np.array(pose16).reshape(4, 4, order='F')
 
 
 def mat_to_pose16(T):
-    """4×4 numpy array → column-major 16 floats list."""
     return T.flatten(order='F').tolist()
 
 
 def rotation_error_vec(R_target, R_current):
-    """Rotation error as axis-angle vector in robot base frame.
-
-    Returns ω ∈ ℝ³ such that exp([ω]×) ≈ R_target @ R_current.T.
-    ||ω|| = rotation angle in radians, ω/||ω|| = rotation axis.
-
-    Parameters
-    ----------
-    R_target, R_current : np.ndarray[3, 3]
-        Rotation matrices in robot base frame.
-    """
+    """Rotation error as axis-angle vector (ω ∈ ℝ³, ||ω|| = angle in rad)."""
     R_err = R_target @ R_current.T
     cos_a = np.clip((np.trace(R_err) - 1.0) / 2.0, -1.0, 1.0)
     angle = np.arccos(cos_a)
@@ -118,68 +107,41 @@ def rotation_error_vec(R_target, R_current):
 
 
 def pose_to_cartesian_velocity(T_target, T_current, ik):
-    """Convert pose error to normalized 6D Cartesian velocity for RobotIKSolver.
-
-    RobotIKSolver expects velocity components in [-1, 1]:
-      - lin_vel = 1.0 means "move at max_lin_delta (75 mm) this step"
-      - rot_vel = 1.0 means "rotate at max_rot_delta (0.15 rad) this step"
-
-    Position and rotation errors are scaled by these limits. The norm of
-    each component is independently clipped to 1.0 before passing to the
-    IK solver (which performs the same clipping internally).
-
-    Parameters
-    ----------
-    T_target, T_current : np.ndarray[4, 4]
-        Target and current EEF poses in robot base frame.
-    ik : RobotIKSolver
-
-    Returns
-    -------
-    np.ndarray[6]
-        Normalized Cartesian velocity [lin_vel (3), rot_vel (3)].
-    """
-    # Position error in base frame (metres)
-    p_err = T_target[:3, 3] - T_current[:3, 3]
-
-    # Rotation error: axis-angle vector in base frame (radians)
+    """Convert pose error to normalised 6D Cartesian velocity for RobotIKSolver."""
+    p_err   = T_target[:3, 3] - T_current[:3, 3]
     rot_err = rotation_error_vec(T_target[:3, :3], T_current[:3, :3])
-
-    # Normalize to [-1, 1] by the per-step limits
     lin_vel = p_err   / ik.max_lin_delta
     rot_vel = rot_err / ik.max_rot_delta
-
-    # Clip norms to 1.0 so a large error doesn't violate IK velocity limits
     lin_norm = np.linalg.norm(lin_vel)
     if lin_norm > 1.0:
         lin_vel /= lin_norm
-
     rot_norm = np.linalg.norm(rot_vel)
     if rot_norm > 1.0:
         rot_vel /= rot_norm
-
     return np.concatenate([lin_vel, rot_vel])
 
 
-# ── Keyboard helper ──────────────────────────────────────────────────────────
+# ── Keyboard helper ───────────────────────────────────────────────────────────
 
 def check_keyboard():
-    """Non-blocking keyboard read. Returns stripped line or None."""
     if select.select([sys.stdin], [], [], 0.0)[0]:
         return sys.stdin.readline().strip().lower()
     return None
 
 
-# ── Status printer ───────────────────────────────────────────────────────────
+# ── Status printer ────────────────────────────────────────────────────────────
 
-def print_status(step, enabled, pos_err_mm, rot_err_deg, hz, gripper):
+def print_status(step, enabled, recording, waiting, label, pos_err_mm, rot_err_deg, hz, gripper):
+    if waiting:
+        rec_str = "WAIT A=ok / B=fail "
+    elif recording:
+        rec_str = f"REC({label or 'unlabeled'})"
+    else:
+        rec_str = "                  "
     sys.stdout.write(
-        f"\r[Step {step:>6}] "
-        f"{'MOVING' if enabled else 'PAUSED':<7} | "
-        f"pos_err={pos_err_mm:>6.1f}mm  "
-        f"rot_err={rot_err_deg:>5.1f}deg | "
-        f"Hz={hz:>5.1f} | "
-        f"gripper={gripper*1000:>4.0f}mm    "
+        f"\r[{step:>6}] {'MOVING' if enabled else 'PAUSED':<7} {rec_str:<19} | "
+        f"pos={pos_err_mm:>6.1f}mm  rot={rot_err_deg:>5.1f}° | "
+        f"Hz={hz:>5.1f} | grip={gripper*1000:>4.0f}mm  "
     )
     sys.stdout.flush()
 
@@ -189,38 +151,13 @@ def print_status(step, enabled, pos_err_mm, rot_err_deg, hz, gripper):
 def main():
     parser = argparse.ArgumentParser(
         description="Franka FR3 teleoperation via VR + IK + joint torque control")
-    parser.add_argument("--left",     action="store_true",
-                        help="Use left controller (default: right)")
-    parser.add_argument("--no_reset", action="store_true",
-                        help="Skip robot reset to home position")
-    parser.add_argument("--hz",       type=int, default=15,
-                        help="Control loop frequency in Hz (default: 15)")
-    parser.add_argument("--host",     type=str, default="192.168.1.6",
-                        help="franka_server host (default: 192.168.1.6)")
-    parser.add_argument("--port",     type=int, default=50052,
-                        help="franka_server gRPC port (default: 50052)")
+    parser.add_argument("--config", default="config/teleop.yaml",
+                        help="Path to YAML config (default: config/teleop.yaml)")
+    cli = parser.parse_args()
 
-    g = parser.add_argument_group("camera recording (optional)")
-    g.add_argument("--cam0",       type=int, default=None,
-                   help="Serial number of first ZED camera")
-    g.add_argument("--cam1",       type=int, default=None,
-                   help="Serial number of second ZED camera")
-    g.add_argument("--cam_fps",    type=int, default=15,
-                   help="Camera capture and video FPS (default: 15)")
-    g.add_argument("--resolution", type=str, default="HD720",
-                   choices=["HD2K", "HD1080", "HD720", "VGA"])
-    g.add_argument("--out_dir",    type=str, default="recordings",
-                   help="Root directory for saved videos (default: recordings/)")
-
-    d = parser.add_argument_group("episode data recording for openvla-oft fine-tuning")
-    d.add_argument("--task",     type=str, default=None,
-                   help="Language instruction for the task (enables HDF5 recording)")
-    d.add_argument("--data_dir", type=str, default="data",
-                   help="Directory for HDF5 episode files (default: data/)")
-    args = parser.parse_args()
-
-    right_controller = not args.left
-    loop_period      = 1.0 / args.hz
+    cfg = load_config(cli.config)
+    right_controller = not cfg["left_controller"]
+    loop_period      = 1.0 / cfg["hz"]
 
     # ── Ctrl+C handler ────────────────────────────────────────────────────────
     running = True
@@ -234,31 +171,31 @@ def main():
 
     signal.signal(signal.SIGINT, _sigint)
 
-    print("=" * 58)
+    print("=" * 62)
     print("Teleoperation  —  VR + IK + joint torque control")
-    print("=" * 58)
+    print("=" * 62)
+    print(f"  Config : {cli.config}")
+    print(f"  Task   : \"{cfg['task']}\"" if cfg["task"] else "  Task   : (none — recording disabled)")
 
     # === Step 1: Connect to franka_server =====================================
-    print(f"\nConnecting to franka_server at {args.host}:{args.port} ...")
-    client = FrankaDirectClient(host=args.host, port=args.port)
+    print(f"\nConnecting to franka_server at {cfg['host']}:{cfg['port']} ...")
+    client = FrankaDirectClient(host=cfg["host"], port=cfg["port"])
     try:
         state = client.wait_until_ready(timeout=20.0)
-        print("[OK] franka_server ready")
-        print(f"     cmd_success_rate = {state['cmd_success_rate']:.3f}")
+        print(f"[OK] franka_server ready  (cmd_success_rate={state['cmd_success_rate']:.3f})")
     except (TimeoutError, RuntimeError) as e:
         print(f"[FAIL] {e}")
         sys.exit(1)
 
     # === Step 2: Initialize IK solver =========================================
-    print("Initializing IK solver (dm_robotics Cartesian6dVelocityEffector) ...")
+    print("Initializing IK solver ...")
     try:
         ik = RobotIKSolver()
         print(f"[OK] IK solver ready  "
               f"(max_lin={ik.max_lin_delta*1000:.0f} mm/step, "
-              f"max_rot={np.degrees(ik.max_rot_delta):.1f} deg/step, "
-              f"max_joint={np.degrees(ik.max_joint_delta):.1f} deg/step)")
+              f"max_rot={np.degrees(ik.max_rot_delta):.1f} deg/step)")
     except Exception as e:
-        print(f"[FAIL] Could not initialize IK solver: {e}")
+        print(f"[FAIL] IK solver: {e}")
         sys.exit(1)
 
     # === Step 3: Initialize VR controller =====================================
@@ -266,153 +203,168 @@ def main():
     try:
         vr = VRController(right_controller=right_controller)
         side = "right" if right_controller else "left"
-        print(f"[OK] VR controller initialized ({side} hand)")
+        print(f"[OK] VR controller initialized ({side} hand, "
+              f"spatial_coeff={cfg['spatial_coeff']:.2f})")
     except Exception as e:
-        print(f"[FAIL] Could not initialize VR controller: {e}")
+        print(f"[FAIL] VR controller: {e}")
         sys.exit(1)
 
-    # === Step 3.5: Initialize data recorder (optional) =======================
+    # === Step 4: Initialize data recorder =====================================
     data_rec = None
-    if args.task is not None:
-        data_rec = DataRecorder(out_dir=args.data_dir)
-        print(f"[OK] Data recorder initialized → {args.data_dir}/")
-        print(f"     Task: \"{args.task}\"")
+    if cfg["task"]:
+        data_rec = DataRecorder(out_dir=cfg["data_dir"])
+        print(f"[OK] Data recorder → {cfg['data_dir']}/")
+        print(f"     Task: \"{cfg['task']}\"")
+        ep_start = data_rec._episode_count
+        print(f"     Next episode index: {ep_start:06d}")
 
-    # === Step 3.6: Initialize cameras (optional) ==============================
+    # === Step 5: Initialize cameras ===========================================
     recorder = None
-    if args.cam0 is not None and args.cam1 is not None:
+    if cfg["cam_enabled"]:
         if not ZED_AVAILABLE:
-            print("[WARN] pyzed not installed — camera recording disabled.")
+            print("[WARN] pyzed not installed — camera disabled.")
         else:
             try:
                 recorder = CameraRecorder(
-                    serial0=args.cam0, serial1=args.cam1,
-                    fps=args.cam_fps, resolution=args.resolution,
-                    out_dir=args.out_dir,
+                    serial0=cfg["cam_serial0"],
+                    serial1=cfg["cam_serial1"],
+                    fps=cfg["cam_fps"],
+                    resolution=cfg["cam_resolution"],
+                    out_dir=os.path.join(cfg["data_dir"], "videos"),
+                    depth=cfg["cam_depth"],
+                    preview=cfg["cam_preview"],
                 )
                 recorder.open()
             except RuntimeError as e:
-                print(f"[WARN] Camera init failed: {e} — recording disabled.")
+                print(f"[WARN] Camera init failed: {e} — continuing without cameras.")
                 recorder = None
 
-    # === Step 4: Optionally reset robot to home ================================
+    # === Step 6: Optionally reset robot to home ================================
     HOME_Q = [0.0, -np.pi / 5, 0.0, -4 * np.pi / 5, 0.0, 3 * np.pi / 5, 0.0]
 
-    if not args.no_reset:
+    if not cfg["no_reset"]:
         print("Resetting robot to home position ...")
         ok, msg = client.reset_to_joints(HOME_Q, speed=0.2)
-        if ok:
-            print("[OK] Robot at home position")
-        else:
-            print(f"[WARN] Reset: {msg}")
+        print("[OK] At home" if ok else f"[WARN] Reset: {msg}")
     else:
-        print("[SKIP] Robot reset skipped (--no_reset)")
+        print("[SKIP] Robot reset skipped (no_reset=true in config)")
 
-    # === Step 5: Print controls ================================================
+    # === Step 7: Print controls ================================================
     btn_a = "A" if right_controller else "X"
     btn_b = "B" if right_controller else "Y"
     print()
-    print("=" * 58)
+    print("=" * 62)
     print("TELEOPERATION READY")
-    print("=" * 58)
-    print(f"  Hold GRIP TRIGGER    → move robot")
+    print("=" * 62)
+    print(f"  Hold GRIP TRIGGER    → move robot" +
+          ("  +  start episode recording" if data_rec else ""))
+    print(f"  Release GRIP         → save episode + reset to home" if data_rec else
+          f"  Release GRIP         → stop movement")
     print(f"  INDEX TRIGGER        → proportional gripper (squeeze = close)")
     print(f"  JOYSTICK press       → recalibrate orientation")
-    if data_rec is not None:
-        print(f"  '{btn_a}'                  → start episode recording")
-        print(f"  '{btn_b}'                  → save episode + reset to home")
-    elif recorder is not None:
-        print(f"  '{btn_a}'                  → start video recording")
-        print(f"  '{btn_b}'                  → stop and save video")
-    print(f"  Ctrl+C               → emergency stop")
+    if data_rec:
+        print(f"  '{btn_a}'                  → mark episode as SUCCESS")
+        print(f"  '{btn_b}'                  → mark episode as FAIL")
     print(f"  r + Enter            → reset VR state")
     print(f"  q + Enter            → quit")
-    print(f"  Control frequency:   {args.hz} Hz")
-    print("=" * 58)
+    print(f"  Ctrl+C               → emergency stop")
+    print(f"  Control frequency:   {cfg['hz']} Hz")
+    if recorder:
+        depth_tag = " + depth" if cfg["cam_depth"] else ""
+        print(f"  Camera:              {cfg['cam_resolution']} @ {cfg['cam_fps']} fps{depth_tag}")
+    print("=" * 62)
     print()
 
-    # === Step 6: Main control loop ============================================
-    step_count      = 0
-    robot_origin    = None    # 4×4, captured when VR origin resets
-    prev_btn_a      = False
-    prev_btn_b      = False
-    last_q_target   = None    # last commanded joint target (for recording hold steps)
-    last_eef_delta  = None    # last delta-EEF action [6] for recording
+    # === Step 8: Main control loop ============================================
+    step_count        = 0
+    robot_origin      = None
+    prev_grip         = False
+    prev_btn_a        = False
+    prev_btn_b        = False
+    episode_label     = ""     # "success" | "fail" | "" (unlabeled)
+    waiting_for_label = False  # True after grip release, before A/B pressed
+    last_q_target     = None
+    last_eef_delta    = None
 
-    GRIPPER_OPEN     = 0.08   # Franka Hand max width [m]
-    GRIPPER_SPEED    = 0.1    # finger speed [m/s]
-    GRIPPER_DEADBAND = 0.002  # only send command if change > 2 mm
+    GRIPPER_OPEN     = 0.08
+    GRIPPER_SPEED    = 0.1   # sent to server but ignored — set gripper_speed in controller.yaml
+    GRIPPER_DEADBAND = 0.002
     last_gripper_cmd = GRIPPER_OPEN
 
     while running:
         loop_start = time.time()
         step_count += 1
 
-        # ── Camera: grab frame (frame-locked to control loop) ───────────────
+        # ── Camera: grab frame ───────────────────────────────────────────────
         if recorder is not None:
             recorder.grab()
 
-        # ── VR controller info ──────────────────────────────────────────────
+        # ── VR controller ────────────────────────────────────────────────────
         info = vr.get_info()
-
-        # ── Button handling (edge-detect to avoid repeat triggers) ──────────
-        cur_a = info["success"]
-        cur_b = info["failure"]
-        if cur_a and not prev_btn_a:
-            print(f"\n[BTN] {btn_a} pressed", end="")
-            if data_rec is not None:
-                if not data_rec.is_recording:
-                    print(" → starting episode recording ...")
-                    data_rec.start_episode()
-                else:
-                    print(f" (already recording: {data_rec.num_steps} steps)")
-            elif recorder is not None:
-                if not recorder.is_recording:
-                    print(" → starting video recording ...")
-                    recorder.start()
-                else:
-                    print(" (already recording)")
-            else:
-                print(" (no recorder active)")
-        if cur_b and not prev_btn_b:
-            print(f"\n[BTN] {btn_b} pressed", end="")
-            if data_rec is not None:
-                if data_rec.is_recording:
-                    if data_rec.num_steps > 0:
-                        print(f" → saving episode ({data_rec.num_steps} steps) ...")
-                        data_rec.save_episode(task=args.task)
-                    else:
-                        print(" → discarding empty episode")
-                        data_rec.discard_episode()
-                    # Reset to home between episodes
-                    print("   Resetting to home position ...")
-                    robot_origin = None
-                    vr.reset_state()
-                    last_q_target  = None
-                    last_eef_delta = None
-                    ok, msg = client.reset_to_joints(HOME_Q, speed=0.2)
-                    if not ok:
-                        print(f"   [WARN] Reset: {msg}")
-                else:
-                    print(" (not recording)")
-            elif recorder is not None:
-                if recorder.is_recording:
-                    print(" → stopping video recording ...")
-                    recorder.stop()
-                else:
-                    print(" (not recording)")
-            else:
-                print(" (no recorder active)")
-        prev_btn_a = cur_a
-        prev_btn_b = cur_b
+        cur_grip  = info["movement_enabled"]
+        cur_a     = info["success"]
+        cur_b     = info["failure"]
 
         if not info["controller_on"]:
-            sys.stdout.write("\r[WARN] VR controller lost. Waiting...          ")
+            sys.stdout.write("\r[WARN] VR controller lost. Waiting...               ")
             sys.stdout.flush()
             time.sleep(1)
             continue
 
-        # ── Keyboard input ──────────────────────────────────────────────────
+        # ── Recording: grip press → start; grip release → wait for label ────────
+        if data_rec is not None:
+            if cur_grip and not prev_grip:
+                # Grip just pressed → start new episode
+                episode_label     = ""
+                waiting_for_label = False
+                data_rec.start_episode()
+                print(f"\n[REC] Episode {data_rec._episode_count:06d} started")
+
+            elif not cur_grip and prev_grip:
+                # Grip just released → stop recording steps, wait for A/B
+                if data_rec.is_recording:
+                    if data_rec.num_steps > 0:
+                        waiting_for_label = True
+                        print(f"\n[REC] {data_rec.num_steps} steps captured — "
+                              f"press A=success / B=fail ...")
+                    else:
+                        data_rec.discard_episode()
+                        print("\n[REC] Discarded empty episode")
+
+        # ── A/B: save + reset when waiting; otherwise pre-label during recording ─
+        if data_rec is not None:
+            if waiting_for_label:
+                label_pressed = None
+                if cur_a and not prev_btn_a:
+                    label_pressed = "success"
+                elif cur_b and not prev_btn_b:
+                    label_pressed = "fail"
+                if label_pressed is not None:
+                    waiting_for_label = False
+                    data_rec.save_episode(task=cfg["task"], label=label_pressed)
+                    episode_label  = ""
+                    print("      Resetting to home ...")
+                    robot_origin   = None
+                    last_q_target  = None
+                    last_eef_delta = None
+                    vr.reset_state()
+                    ok, msg = client.reset_to_joints(HOME_Q, speed=0.2)
+                    if not ok:
+                        print(f"      [WARN] Reset: {msg}")
+            elif data_rec.is_recording:
+                # Pre-label while still holding grip (optional early hint)
+                if cur_a and not prev_btn_a:
+                    episode_label = "success"
+                    print(f"\n[LABEL] → success (will confirm on grip release)")
+                if cur_b and not prev_btn_b:
+                    episode_label = "fail"
+                    print(f"\n[LABEL] → fail (will confirm on grip release)")
+
+        prev_grip  = cur_grip
+        prev_btn_a = cur_a
+        prev_btn_b = cur_b
+
+        # ── Keyboard ─────────────────────────────────────────────────────────
         key = check_keyboard()
         if key == "q":
             print("\n\n[DONE] 'q' pressed — quitting")
@@ -424,7 +376,7 @@ def main():
             print("VR state reset. Hold grip trigger to start again.")
             continue
 
-        # ── Get current robot state ─────────────────────────────────────────
+        # ── Get current robot state ───────────────────────────────────────────
         state = client.get_robot_state()
         if state["error"]:
             print(f"\n[ERROR] Robot error: {state['error']}")
@@ -432,58 +384,45 @@ def main():
 
         T_current = pose16_to_mat(state["pose"])
 
-        # ── Arm: move when grip trigger held ─────────────────────────────────
+        # ── Arm: move when grip trigger held ──────────────────────────────────
         pos_err_mm  = 0.0
         rot_err_deg = 0.0
 
         if info["movement_enabled"]:
             pos_delta, rot_delta, _ = vr.get_pose_delta()
 
-            # Capture robot EEF origin when VR origin resets
             if vr.origin_just_reset:
                 robot_origin = T_current.copy()
 
             elif pos_delta is not None and robot_origin is not None:
-                # ── Compose VR delta with robot origin → absolute EEF target ──
-                # T_target.R = ΔR @ R_robot_origin  (extrinsic rotation, base frame)
-                # T_target.t = t_robot_origin + Δt   (additive in base frame)
+                # Apply spatial_coeff to position delta
+                pos_delta_scaled = pos_delta * cfg["spatial_coeff"]
+
                 T_target = np.eye(4)
                 T_target[:3, :3] = rot_delta @ robot_origin[:3, :3]
-                T_target[:3, 3]  = robot_origin[:3, 3] + pos_delta
+                T_target[:3, 3]  = robot_origin[:3, 3] + pos_delta_scaled
 
-                # ── IK: pose error → Cartesian velocity → joint delta ──────────
-                # 1. Compute normalised 6D Cartesian velocity from pose error.
                 cart_vel = pose_to_cartesian_velocity(T_target, T_current, ik)
 
-                # 2. dm_robotics IK: Cartesian velocity → joint velocity.
-                #    Uses the MuJoCo FR3 model at current joint state.
                 robot_state_dict = {
-                    "joint_positions": state["q"],
+                    "joint_positions":  state["q"],
                     "joint_velocities": state["dq"] if state["dq"] else [0.0] * 7,
                 }
                 joint_vel   = ik.cartesian_velocity_to_joint_velocity(cart_vel, robot_state_dict)
-
-                # 3. Scale joint velocity → joint delta (max 0.2 rad/step).
                 joint_delta = ik.joint_velocity_to_delta(joint_vel)
-
-                # 4. New joint target = current q + IK delta.
-                q_target = (np.array(state["q"]) + joint_delta).tolist()
+                q_target    = (np.array(state["q"]) + joint_delta).tolist()
                 client.set_joint_target(q_target)
                 last_q_target = q_target
 
-                # 5. Delta-EEF action: [pos_delta (m), rot_vec (rad)].
                 rot_vec = rotation_error_vec(rot_delta, np.eye(3))
-                last_eef_delta = np.concatenate([pos_delta, rot_vec])
+                last_eef_delta = np.concatenate([pos_delta_scaled, rot_vec])
 
-                # Tracking errors for status display
                 pos_err_mm  = np.linalg.norm(T_target[:3, 3] - T_current[:3, 3]) * 1000.0
                 rot_err_deg = np.degrees(np.arccos(np.clip(
                     (np.trace(T_target[:3, :3] @ T_current[:3, :3].T) - 1.0) / 2.0,
                     -1.0, 1.0)))
 
-        # ── Gripper: proportional from index trigger ─────────────────────────
-        # Trigger value ∈ [0, 1]: 0 = released (open), 1 = fully squeezed (close).
-        # Gripper width = (1 - trigger) * GRIPPER_OPEN, sent only on > 2 mm change.
+        # ── Gripper ───────────────────────────────────────────────────────────
         trig_key   = "rightTrig" if right_controller else "leftTrig"
         index_trig = vr._state["buttons"].get(trig_key, (0.0,))
         if isinstance(index_trig, (tuple, list)):
@@ -494,23 +433,22 @@ def main():
             client.set_gripper_target(gripper_target, GRIPPER_SPEED)
             last_gripper_cmd = gripper_target
 
-        # ── Record step (if episode recording active) ───────────────────────
-        if data_rec is not None and data_rec.is_recording:
+        # ── Record step (only while grip is held, not while waiting for label) ──
+        if data_rec is not None and data_rec.is_recording and not waiting_for_label:
             step_q_target  = last_q_target if last_q_target is not None else state["q"]
             step_grip_norm = last_gripper_cmd / GRIPPER_OPEN
-            # last_eef_delta is None before first motion; zero = hold position
-            step_eef_delta = last_eef_delta if last_eef_delta is not None \
-                             else np.zeros(6)
-            img_p = img_w = None
+            step_eef_delta = last_eef_delta if last_eef_delta is not None else np.zeros(6)
+            img_p = img_w = depth_p = depth_w = None
             if recorder is not None:
-                img_p = getattr(recorder, "last_frame0", None)
-                img_w = getattr(recorder, "last_frame1", None)
+                img_p   = recorder.last_frame0
+                img_w   = recorder.last_frame1
+                depth_p = getattr(recorder, "last_depth0", None)
+                depth_w = getattr(recorder, "last_depth1", None)
             data_rec.record_step(state, step_q_target, step_grip_norm,
-                                 step_eef_delta, img_p, img_w)
-            # eef delta is only non-zero on the step it's commanded; reset each tick
+                                 step_eef_delta, img_p, img_w, depth_p, depth_w)
             last_eef_delta = None
 
-        # ── Regulate frequency ──────────────────────────────────────────────
+        # ── Regulate frequency ────────────────────────────────────────────────
         elapsed = time.time() - loop_start
         sleep_t = loop_period - elapsed
         if sleep_t > 0:
@@ -518,20 +456,22 @@ def main():
 
         actual_hz = 1.0 / max(time.time() - loop_start, 1e-6)
         print_status(step_count, info["movement_enabled"],
-                     pos_err_mm, rot_err_deg, actual_hz, state["gripper_width"])
+                     (data_rec.is_recording and not waiting_for_label) if data_rec else False,
+                     waiting_for_label,
+                     episode_label, pos_err_mm, rot_err_deg, actual_hz,
+                     state["gripper_width"])
 
     # === Cleanup ==============================================================
     print("\nTeleoperation ended.")
     print(f"Total steps: {step_count}")
+    # Discard any unsaved episode (auto-save disabled per user preference)
     if data_rec is not None and data_rec.is_recording:
-        n = data_rec.num_steps
+        n = data_rec.discard_episode()
         if n > 0:
-            print(f"[REC] Unsaved episode ({n} steps) — saving on exit ...")
-            data_rec.save_episode(task=args.task)
-        else:
-            data_rec.discard_episode()
+            state_str = "awaiting label" if waiting_for_label else "in-progress"
+            print(f"[REC] {state_str.capitalize()} episode ({n} steps) discarded.")
     if recorder is not None:
-        recorder.close()   # saves any in-progress recording, closes cameras
+        recorder.close()
     try:
         client.stop()
         client.close()
