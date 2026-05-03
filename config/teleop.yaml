@@ -16,7 +16,7 @@ hz: 15
 
 # VR controller
 left_controller: false
-spatial_coeff: 1.0        # position delta multiplier (larger = faster arm motion)
+spatial_coeff: 3.0        # position delta multiplier (larger = faster arm motion)
 
 # IK solver parameters
 ik:
@@ -32,7 +32,7 @@ no_reset: false
 # Reset motion parameters
 reset:
   speed:      0.2      # joint-space motion speed passed to reset_to_joints
-  randomize:  false    # apply random EEF noise on each reset
+  randomize:  true    # apply random EEF noise on each reset
   noise:
     pos_low:  [-0.10, -0.20, -0.10]   # x, y, z lower bound [m]
     pos_high: [ 0.10,  0.20,  0.10]   # x, y, z upper bound [m]

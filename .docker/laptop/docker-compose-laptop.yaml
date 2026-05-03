@@ -20,8 +20,9 @@ services:
       - ${ROOT_DIR}/python:/app/python
       - ${ROOT_DIR}/robot_ik:/app/robot_ik
       - ${ROOT_DIR}/oculus_reader:/app/oculus_reader
+      - ${ROOT_DIR}/proto:/app/proto
+      - ${ROOT_DIR}/config:/app/config
       - ${ROOT_DIR}/parameters.py:/app/parameters.py
-      - ${ROOT_DIR}/recordings:/app/recordings
     devices:
       - "/dev:/dev"
     runtime: nvidia
