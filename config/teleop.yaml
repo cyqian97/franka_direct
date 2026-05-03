@@ -29,6 +29,16 @@ ik:
 # Skip robot reset to home on startup
 no_reset: false
 
+# Reset motion parameters
+reset:
+  speed:      0.2      # joint-space motion speed passed to reset_to_joints
+  randomize:  false    # apply random EEF noise on each reset
+  noise:
+    pos_low:  [-0.10, -0.20, -0.10]   # x, y, z lower bound [m]
+    pos_high: [ 0.10,  0.20,  0.10]   # x, y, z upper bound [m]
+    rot_low:  [-0.30, -0.30, -0.30]   # roll, pitch, yaw lower bound [rad]
+    rot_high: [ 0.30,  0.30,  0.30]   # roll, pitch, yaw upper bound [rad]
+
 # Gripper parameters
 gripper:
   open_m:    0.08    # Franka Hand max opening [m]

@@ -58,6 +58,7 @@ except ImportError as e:
 from zed_utils import CameraRecorder, ZED_AVAILABLE
 from data_recorder import DataRecorder
 from vr_controller import VRController
+from robot_reset import reset_to_home, HOME_Q
 
 
 # ── Config loading ────────────────────────────────────────────────────────────
@@ -92,6 +93,12 @@ def load_config(path: str) -> dict:
         "gripper_open":     float(d.get("gripper", {}).get("open_m",   0.08)),
         "gripper_speed":    float(d.get("gripper", {}).get("speed",    0.1)),
         "gripper_deadband": float(d.get("gripper", {}).get("deadband", 0.002)),
+        "reset_speed":      float(d.get("reset", {}).get("speed", 0.2)),
+        "reset_randomize":  bool( d.get("reset", {}).get("randomize", False)),
+        "reset_pos_low":    list( d.get("reset", {}).get("noise", {}).get("pos_low",  [-0.10, -0.20, -0.10])),
+        "reset_pos_high":   list( d.get("reset", {}).get("noise", {}).get("pos_high", [ 0.10,  0.20,  0.10])),
+        "reset_rot_low":    list( d.get("reset", {}).get("noise", {}).get("rot_low",  [-0.30, -0.30, -0.30])),
+        "reset_rot_high":   list( d.get("reset", {}).get("noise", {}).get("rot_high", [ 0.30,  0.30,  0.30])),
     }
 
 
@@ -268,11 +275,9 @@ def main():
                 recorder = None
 
     # === Step 6: Optionally reset robot to home ================================
-    HOME_Q = [0.0, -np.pi / 5, 0.0, -4 * np.pi / 5, 0.0, 3 * np.pi / 5, 0.0]
-
     if not cfg["no_reset"]:
         print("Resetting robot to home position ...")
-        ok, msg = client.reset_to_joints(HOME_Q, speed=0.2)
+        ok, msg = reset_to_home(client, ik, cfg)
         print("[OK] At home" if ok else f"[WARN] Reset: {msg}")
     else:
         print("[SKIP] Robot reset skipped (no_reset=true in config)")
@@ -373,7 +378,7 @@ def main():
                     last_q_target  = None
                     last_eef_delta = None
                     vr.reset_state()
-                    ok, msg = client.reset_to_joints(HOME_Q, speed=0.2)
+                    ok, msg = reset_to_home(client, ik, cfg)
                     if not ok:
                         print(f"      [WARN] Reset: {msg}")
             elif data_rec.is_recording:
