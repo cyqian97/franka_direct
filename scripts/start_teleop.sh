@@ -9,6 +9,10 @@ LAPTOP_CTR="laptop-franka_direct_laptop-1"
 echo "=== Syncing controller.yaml to NUC ==="
 scp config/controller.yaml "$NUC_HOST:$NUC_CONFIG_DIR/controller.yaml"
 
+# === 2. Launch franka_server on NUC (background — teleop will wait for ready) =
+echo "=== Launching franka_server on NUC ==="
+ssh "$NUC_HOST" "docker exec nuc-franka_direct_nuc-1 bash -c 'bash /app/build.sh && bash /app/launch_server.sh'" &
+sleep 5
 # === 3. Start teleoperation ===================================================
 echo "=== Starting teleoperation ==="
 docker exec -it "$LAPTOP_CTR" bash -c "
