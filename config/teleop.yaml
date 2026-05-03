@@ -29,6 +29,12 @@ ik:
 # Skip robot reset to home on startup
 no_reset: false
 
+# Gripper parameters
+gripper:
+  open_m:    0.08    # Franka Hand max opening [m]
+  speed:     0.1     # finger speed [m/s] — sent to server; actual speed set in controller.yaml
+  deadband:  0.002   # min width change [m] required to issue a new gripper command
+
 # ZED camera settings (set enabled: true to record camera data)
 camera:
   enabled: false

@@ -25,10 +25,13 @@ Controls:
 
 import argparse
 import os
+import re
 import select
+import shutil
 import signal
 import sys
 import time
+from datetime import datetime
 
 import numpy as np
 import yaml
@@ -86,6 +89,9 @@ def load_config(path: str) -> dict:
         "cam_resolution":   str(cam.get("resolution", "HD720")),
         "cam_depth":        bool(cam.get("depth", False)),
         "cam_preview":      bool(cam.get("preview", True)),
+        "gripper_open":     float(d.get("gripper", {}).get("open_m",   0.08)),
+        "gripper_speed":    float(d.get("gripper", {}).get("speed",    0.1)),
+        "gripper_deadband": float(d.get("gripper", {}).get("deadband", 0.002)),
     }
 
 
@@ -225,11 +231,20 @@ def main():
     # === Step 4: Initialize data recorder =====================================
     data_rec = None
     if cfg["task"]:
-        data_rec = DataRecorder(out_dir=cfg["data_dir"])
-        print(f"[OK] Data recorder → {cfg['data_dir']}/")
+        task_slug   = re.sub(r"[^a-zA-Z0-9_-]", "_", cfg["task"].replace(" ", "_"))
+        timestamp   = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        session_dir = os.path.join(cfg["data_dir"], task_slug, timestamp)
+        os.makedirs(session_dir, exist_ok=True)
+
+        # Snapshot the configs used for this session
+        shutil.copy2(cli.config, session_dir)
+        controller_yaml = os.path.join(REPO_ROOT, "config", "controller.yaml")
+        if os.path.exists(controller_yaml):
+            shutil.copy2(controller_yaml, session_dir)
+
+        data_rec = DataRecorder(out_dir=session_dir, gripper_open_m=cfg["gripper_open"])
+        print(f"[OK] Data recorder → {session_dir}/")
         print(f"     Task: \"{cfg['task']}\"")
-        ep_start = data_rec._episode_count
-        print(f"     Next episode index: {ep_start:06d}")
 
     # === Step 5: Initialize cameras ===========================================
     recorder = None
@@ -299,10 +314,7 @@ def main():
     last_q_target     = None
     last_eef_delta    = None
 
-    GRIPPER_OPEN     = 0.08
-    GRIPPER_SPEED    = 0.1   # sent to server but ignored — set gripper_speed in controller.yaml
-    GRIPPER_DEADBAND = 0.002
-    last_gripper_cmd = GRIPPER_OPEN
+    last_gripper_cmd = cfg["gripper_open"]
 
     while running:
         loop_start = time.time()
@@ -441,15 +453,15 @@ def main():
         if isinstance(index_trig, (tuple, list)):
             index_trig = index_trig[0]
 
-        gripper_target = (1.0 - float(index_trig)) * GRIPPER_OPEN
-        if abs(gripper_target - last_gripper_cmd) > GRIPPER_DEADBAND:
-            client.set_gripper_target(gripper_target, GRIPPER_SPEED)
+        gripper_target = (1.0 - float(index_trig)) * cfg["gripper_open"]
+        if abs(gripper_target - last_gripper_cmd) > cfg["gripper_deadband"]:
+            client.set_gripper_target(gripper_target, cfg["gripper_speed"])
             last_gripper_cmd = gripper_target
 
         # ── Record step (only while grip is held, not while waiting for label) ──
         if data_rec is not None and data_rec.is_recording and not waiting_for_label:
             step_q_target  = last_q_target if last_q_target is not None else state["q"]
-            step_grip_norm = last_gripper_cmd / GRIPPER_OPEN
+            step_grip_norm = last_gripper_cmd / cfg["gripper_open"]
             step_eef_delta = last_eef_delta if last_eef_delta is not None else np.zeros(6)
             img_p = img_w = depth_p = depth_w = None
             if recorder is not None:

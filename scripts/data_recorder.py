@@ -45,13 +45,16 @@ Episode filename suffix:
     episode_000002.hdf5          (no label)
 """
 
+import json
 import os
+import time
 from typing import Optional
 
 import h5py
 import numpy as np
+from PIL import Image
 
-GRIPPER_OPEN_M = 0.08   # Franka Hand max opening (metres)
+_GRIPPER_OPEN_M_DEFAULT = 0.08   # Franka Hand max opening (metres)
 
 # Extended libfranka fields: (key, default_shape, dtype)
 _EXT_FIELDS = [
@@ -91,8 +94,9 @@ class DataRecorder:
         # or: rec.discard_episode()
     """
 
-    def __init__(self, out_dir: str = "data"):
+    def __init__(self, out_dir: str = "data", gripper_open_m: float = _GRIPPER_OPEN_M_DEFAULT):
         self._out_dir = out_dir
+        self._gripper_open_m = gripper_open_m
         self._buf: Optional[list] = None
         self._episode_count = self._count_existing_episodes()
 
@@ -144,7 +148,7 @@ class DataRecorder:
             "qpos":                 np.array(state["q"],    dtype=np.float32),
             "qvel":                 np.array(state["dq"] or [0.0] * 7, dtype=np.float32),
             "ee_pose":              np.array(state["pose"], dtype=np.float32),
-            "gripper":              np.array([state["gripper_width"] / GRIPPER_OPEN_M],
+            "gripper":              np.array([state["gripper_width"] / self._gripper_open_m],
                                              dtype=np.float32),
             "q_target":             np.array(q_target,     dtype=np.float32),
             "eef_delta_6d":         np.array(eef_delta_6d, dtype=np.float32),
@@ -246,6 +250,28 @@ class DataRecorder:
             f.create_dataset("action_eef",
                              data=np.concatenate([ed_arr, gn_arr], axis=-1),
                              dtype=np.float32)
+
+        # Duration from robot timestamps (time_s column, first field)
+        t0 = float(self._buf[0]["time_s"][0])
+        t1 = float(self._buf[-1]["time_s"][0])
+        duration_s = round(t1 - t0, 4) if t1 > t0 else None
+
+        status = {
+            "episode":    self._episode_count,
+            "label":      label or "",
+            "task":       task,
+            "num_steps":  T,
+            "saved_at":   time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "duration_s": duration_s,
+            "hdf5_file":  os.path.basename(path),
+        }
+        status_path = path.replace(".hdf5", ".json")
+        with open(status_path, "w") as sf:
+            json.dump(status, sf, indent=2)
+
+        if "img_primary" in self._buf[0]:
+            cover_path = path.replace(".hdf5", "_cover.jpg")
+            Image.fromarray(self._buf[0]["img_primary"]).save(cover_path, quality=90)
 
         lbl_str = f" [{label}]" if label else ""
         print(f"[REC] Saved {T} steps{lbl_str} → {path}")
