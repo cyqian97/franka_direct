@@ -64,6 +64,7 @@ def load_config(path: str) -> dict:
     with open(path) as f:
         d = yaml.safe_load(f) or {}
     cam = d.get("camera", {})
+    ik  = d.get("ik", {})
     return {
         "task":             d.get("task", ""),
         "data_dir":         d.get("data_dir", "data"),
@@ -73,6 +74,11 @@ def load_config(path: str) -> dict:
         "left_controller":  bool(d.get("left_controller", False)),
         "spatial_coeff":    float(d.get("spatial_coeff", 1.0)),
         "no_reset":         bool(d.get("no_reset", False)),
+        "ik_max_lin_delta":     float(ik.get("max_lin_delta",    0.075)),
+        "ik_max_rot_delta":     float(ik.get("max_rot_delta",    0.15)),
+        "ik_max_joint_delta":   float(ik.get("max_joint_delta",  0.2)),
+        "ik_max_gripper_delta": float(ik.get("max_gripper_delta",0.25)),
+        "ik_control_hz":        int(  ik.get("control_hz",       15)),
         "cam_enabled":      bool(cam.get("enabled", False)),
         "cam_serial0":      cam.get("serial0"),    # int or None
         "cam_serial1":      cam.get("serial1"),
@@ -190,10 +196,17 @@ def main():
     # === Step 2: Initialize IK solver =========================================
     print("Initializing IK solver ...")
     try:
-        ik = RobotIKSolver()
+        ik = RobotIKSolver(
+            max_lin_delta=cfg["ik_max_lin_delta"],
+            max_rot_delta=cfg["ik_max_rot_delta"],
+            max_joint_delta=cfg["ik_max_joint_delta"],
+            max_gripper_delta=cfg["ik_max_gripper_delta"],
+            control_hz=cfg["ik_control_hz"],
+        )
         print(f"[OK] IK solver ready  "
-              f"(max_lin={ik.max_lin_delta*1000:.0f} mm/step, "
-              f"max_rot={np.degrees(ik.max_rot_delta):.1f} deg/step)")
+              f"(lin={ik.max_lin_delta*1000:.0f} mm, "
+              f"rot={np.degrees(ik.max_rot_delta):.1f}°, "
+              f"joint={np.degrees(ik.max_joint_delta):.1f}°  per step)")
     except Exception as e:
         print(f"[FAIL] IK solver: {e}")
         sys.exit(1)

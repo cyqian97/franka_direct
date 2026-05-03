@@ -18,6 +18,14 @@ hz: 15
 left_controller: false
 spatial_coeff: 1.0        # position delta multiplier (larger = faster arm motion)
 
+# IK solver parameters
+ik:
+  max_lin_delta: 0.075    # max EEF translation per control step [m]
+  max_rot_delta: 0.15     # max EEF rotation per control step [rad]
+  max_joint_delta: 0.2    # max per-joint position change per step [rad]
+  max_gripper_delta: 0.25 # max gripper delta per step (normalisation only)
+  control_hz: 15          # must match top-level hz
+
 # Skip robot reset to home on startup
 no_reset: false
 
