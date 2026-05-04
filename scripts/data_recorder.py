@@ -141,6 +141,8 @@ class DataRecorder:
         if self._buf is None:
             raise RuntimeError("Call start_episode() before record_step().")
 
+        step_wall_time = time.time()
+
         if eef_delta_6d is None:
             eef_delta_6d = np.zeros(6, dtype=np.float32)
 
@@ -153,6 +155,7 @@ class DataRecorder:
             "q_target":             np.array(q_target,     dtype=np.float32),
             "eef_delta_6d":         np.array(eef_delta_6d, dtype=np.float32),
             "gripper_norm":         float(gripper_norm),
+            "step_timestamp":       step_wall_time,
         }
 
         # Extended libfranka fields (default to zeros if not in state dict)
@@ -206,6 +209,10 @@ class DataRecorder:
 
             obs = f.create_group("observations")
 
+            obs.create_dataset("step_timestamp",
+                               data=np.array([s["step_timestamp"] for s in self._buf],
+                                             dtype=np.float64))
+
             obs.create_dataset("qpos",    data=np.stack([s["qpos"]    for s in self._buf]),
                                dtype=np.float32)
             obs.create_dataset("qvel",    data=np.stack([s["qvel"]    for s in self._buf]),
@@ -256,6 +263,16 @@ class DataRecorder:
         t1 = float(self._buf[-1]["time_s"][0])
         duration_s = round(t1 - t0, 4) if t1 > t0 else None
 
+        # Frame rate stats from wall-clock step timestamps
+        wall_ts = np.array([s["step_timestamp"] for s in self._buf])
+        if len(wall_ts) >= 2:
+            intervals = np.diff(wall_ts)
+            fps_per_interval = 1.0 / intervals[intervals > 0]
+            fps_mean = round(float(np.mean(fps_per_interval)), 3) if len(fps_per_interval) else None
+            fps_std  = round(float(np.std(fps_per_interval)),  3) if len(fps_per_interval) else None
+        else:
+            fps_mean = fps_std = None
+
         status = {
             "episode":    self._episode_count,
             "label":      label or "",
@@ -263,6 +280,8 @@ class DataRecorder:
             "num_steps":  T,
             "saved_at":   time.strftime("%Y-%m-%dT%H:%M:%S"),
             "duration_s": duration_s,
+            "fps_mean":   fps_mean,
+            "fps_std":    fps_std,
             "hdf5_file":  os.path.basename(path),
         }
         status_path = path.replace(".hdf5", ".json")

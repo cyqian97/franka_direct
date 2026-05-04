@@ -23,6 +23,7 @@ services:
       - ${ROOT_DIR}/proto:/app/proto
       - ${ROOT_DIR}/config:/app/config
       - ${ROOT_DIR}/parameters.py:/app/parameters.py
+      - /data:/app/data
     devices:
       - "/dev:/dev"
     runtime: nvidia

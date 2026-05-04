@@ -20,5 +20,4 @@ docker exec -it "$LAPTOP_CTR" bash -c "
     conda activate robot && \
     pip install -q grpcio grpcio-tools protobuf==3.20.1 && \
     bash /app/python/generate_stubs.sh && \
-    python /app/scripts/simple_teleop_direct_torque.py --config /app/config/teleop.yaml
-"
+    python /app/scripts/simple_teleop_direct_torque.py --config /app/config/teleop.yaml"
